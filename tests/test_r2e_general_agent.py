@@ -7,6 +7,8 @@ This configures a GeneralAgent instance with R2E tools that execute in K8S.
 import asyncio
 import sys
 import os
+import json
+from datetime import datetime
 
 # Try to load .env file if python-dotenv is available
 try:
@@ -18,13 +20,12 @@ except ImportError:
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from workers.agents.general_agent import GeneralAgent
+from workers.agents.general_agent import GeneralAgent, dump_trajectory, save_trajectory_as_messages
 from workers.core import create_tool
 from workers.utils import create_llm_client
 from workers.core.trajectory import TrajectoryStep, StepType
 import logging
 import re
-import os
 from typing import Dict, Any, List, Optional, Union
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -175,24 +176,13 @@ def parse_xml_action_custom(output: str) -> Optional[Union[Dict[str, Any], List[
     text_before_function = output[:function_match.start()].strip()
     
     if text_before_function:
-        # Create both thought and action steps
-        steps = []
-        
-        steps.append(TrajectoryStep(
-            step_type=StepType.THOUGHT,
-            content=text_before_function,
-            metadata={"raw_output": output, "xml_parsed": True}
-        ))
-        
-        steps.append(TrajectoryStep(
-            step_type=StepType.ACTION,
-            content=function_match.group(0),
-            metadata={"raw_output": output, "xml_parsed": True},
-            tool_name=mapped_tool_name,
-            tool_args=tool_args
-        ))
-        
-        return steps
+        # When we have both thought and action, return a single ACTION step
+        return {
+            "tool_name": mapped_tool_name,
+            "tool_args": tool_args,
+            "thought_content": text_before_function,
+            "has_thought": True
+        }
     else:
         return {
             "tool_name": mapped_tool_name,
@@ -220,11 +210,19 @@ class CustomDescriptionWrapper:
         return getattr(self.tool, name)
 
 
-async def test_r2e_general_agent_k8s():
-    """Test GeneralAgent with R2E tools in K8S execution mode."""
+async def test_r2e_general_agent_k8s(output_dir: str = "./trajectories"):
+    """Test GeneralAgent with R2E tools in K8S execution mode.
+    
+    Args:
+        output_dir: Directory to save trajectory files
+    """
     print("\n" + "="*80)
     print("🚀 Testing GeneralAgent with R2E Tools (K8S Execution)")
     print("="*80)
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"\n📁 Trajectory output directory: {output_dir}")
     
     # K8S configuration for swebench-xarray-pod
     k8s_config = {
@@ -302,8 +300,11 @@ We have access to the following functions:
 
 {tools['r2e_submit'].get_description()}
 
-If you choose to call a function ONLY reply in the following format with NO suffix:
+When calling a function, your response should follow this format:
 
+First, explain your reasoning and what you plan to do (as natural text).
+
+Then, make the function call in this exact format:
 <function=example_function_name>
 <parameter=example_parameter_1>value_1</parameter>
 <parameter=example_parameter_2>
@@ -315,10 +316,11 @@ multiple lines
 
 <IMPORTANT>
 Reminder:
-- Function calls MUST follow the specified format, start with <function= and end with </function>
+- ALWAYS start with your reasoning/thought process before the function call
+- Function calls MUST follow the specified XML format
 - Required parameters MUST be specified
 - Only call one function at a time
-- VERY IMPORTANT: Each response must include both reasoning (as natural text) and function call (in above format) to solve the task.
+- Your complete response = reasoning (natural text) + function call (XML format)
 {additional_instructions}"""
         
         return prompt
@@ -394,6 +396,12 @@ Reminder:
         print(f"Total steps: {len(result.steps)}")
         print(f"Completed: {result.is_completed}")
         
+        # Save trajectory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        trajectory_file = os.path.join(output_dir, f"task1_explore_{timestamp}.jsonl")
+        dump_trajectory(result, trajectory_file, format="jsonl")
+        print(f"📝 Saved trajectory to: {trajectory_file}")
+        
     except Exception as e:
         print(f"\n❌ Task 1 failed: {e}")
     
@@ -425,27 +433,69 @@ Reminder:
         print(f"Total steps: {len(result.steps)}")
         print(f"Completed: {result.is_completed}")
         
+        # Save trajectory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        trajectory_file = os.path.join(output_dir, f"task2_file_ops_{timestamp}.jsonl")
+        dump_trajectory(result, trajectory_file, format="jsonl")
+        print(f"📝 Saved trajectory to: {trajectory_file}")
+        
+        # Also save a more detailed version
+        detailed_trajectory = os.path.join(output_dir, f"task2_file_ops_{timestamp}_detailed.json")
+        dump_trajectory(result, detailed_trajectory, format="json")
+        print(f"📝 Saved detailed trajectory to: {detailed_trajectory}")
+        
     except Exception as e:
         print(f"\n❌ Task 2 failed: {e}")
     
     print("\n" + "="*80)
     print("🎉 R2E GeneralAgent K8S test completed!")
+    print(f"📁 All trajectories saved to: {output_dir}")
     print("="*80)
+    
+    # Create a summary file
+    summary_file = os.path.join(output_dir, "summary.json")
+    summary = {
+        "test_run": datetime.now().isoformat(),
+        "output_directory": output_dir,
+        "tasks_executed": 2,
+        "trajectories_saved": [
+            f"task1_explore_{timestamp}.jsonl",
+            f"task2_file_ops_{timestamp}.jsonl"
+        ],
+        "configuration": {
+            "model": MODEL_NAME,
+            "max_rounds": agent.max_rounds,
+            "k8s_pod": k8s_config["pod_name"],
+            "k8s_namespace": k8s_config["namespace"]
+        }
+    }
+    with open(summary_file, 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f"📝 Summary saved to: {summary_file}")
 
 
 async def main():
     """Main test function."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Test R2E GeneralAgent with trajectory saving")
+    parser.add_argument("--output-dir", default="./trajectories", 
+                       help="Directory to save trajectory files (default: ./trajectories)")
+    args = parser.parse_args()
+    
     print("🧪 R2E GeneralAgent Test Suite")
     print("Testing GeneralAgent with R2E tools in K8S mode only")
+    print(f"📁 Output directory: {args.output_dir}")
     
     # Skip local test for now - focus on K8S
     # await test_r2e_general_agent_local()
     
-    # Test K8S execution
-    await test_r2e_general_agent_k8s()
+    # Test K8S execution with output directory
+    await test_r2e_general_agent_k8s(output_dir=args.output_dir)
     
     print("\n" + "="*80)
-    print("✅ R2E GeneralAgent K8S test completed!")
+    print("✅ All tests completed!")
+    print(f"📁 Check {args.output_dir} for saved trajectories")
     print("="*80)
 
 

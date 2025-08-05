@@ -39,19 +39,18 @@ class TrajectoryStep:
     def to_message(self) -> Dict[str, str]:
         """Convert step to message format for LLM input."""
         if self.step_type == StepType.OBSERVATION:
+            # Don't add "Task:" or "Observation:" prefix, use content as is
             return {"role": "user", "content": self.content}
         elif self.step_type == StepType.THOUGHT:
-            return {"role": "assistant", "content": f"Thought: {self.content}"}
+            # Use content as is, no "Thought:" prefix
+            return {"role": "assistant", "content": self.content}
         elif self.step_type == StepType.ACTION:
-            if self.tool_name:
-                return {
-                    "role": "assistant", 
-                    "content": f"Action: {self.tool_name}({self.tool_args})"
-                }
-            else:
-                return {"role": "assistant", "content": f"Action: {self.content}"}
+            # Use the original content which contains the full LLM output
+            # This preserves the exact format that the LLM generated
+            return {"role": "assistant", "content": self.content}
         elif self.step_type == StepType.ACTION_RESULT:
-            return {"role": "user", "content": f"Observation: {self.content}"}
+            # Don't add "Observation:" prefix, use content as is
+            return {"role": "user", "content": self.content}
         elif self.step_type == StepType.FINAL_ANSWER:
             return {"role": "assistant", "content": self.content}
         else:

@@ -7,7 +7,9 @@ This agent can be configured to use different tools, system prompts, and termina
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+from datetime import datetime
 
 from ..core.base_agent import BaseAgent
 from ..core.registry import register_agent
@@ -262,6 +264,25 @@ After receiving the observation, continue with the next thought and action until
         """Run a complete ReAct trajectory."""
         trajectory = Trajectory(request_id=request_id)
         
+        # Initialize trajectory metadata
+        # Try to get model name from llm_generate_func if it's an LLMAPIClient method
+        model_name = "unknown"
+        if hasattr(llm_generate_func, "__self__") and hasattr(llm_generate_func.__self__, "model"):
+            model_name = llm_generate_func.__self__.model
+        elif "model_name" in kwargs:
+            model_name = kwargs["model_name"]
+        
+        trajectory.metadata = {
+            "start_time": datetime.now().isoformat(),
+            "model": model_name,
+            "max_rounds": self.max_rounds,
+            "assistant_timings": [],  # List of timing for each assistant response
+            "tool_calls": [],  # List of tool names called
+            "message_lengths": [],  # List of message lengths
+            "total_tool_calls": 0,
+            "error_count": 0
+        }
+        
         # Add initial observation
         initial_content = self._extract_prompt_content(prompt)
         initial_step = TrajectoryStep(
@@ -270,6 +291,11 @@ After receiving the observation, continue with the next thought and action until
             metadata={"prompt": prompt}
         )
         trajectory.add_step(initial_step)
+        trajectory.metadata["message_lengths"].append({
+            "role": "user",
+            "length": len(initial_content),
+            "step_type": "observation"
+        })
         
         consecutive_thoughts = 0
         round_count = 0
@@ -290,12 +316,23 @@ After receiving the observation, continue with the next thought and action until
                 if self.debug:
                     self._log_llm_input(messages, round_count + 1)
                 
+                # Time the LLM generation
+                start_time = time.time()
+                
                 # Generate response
                 response = await llm_generate_func(
                     messages,
                     max_tokens=self.max_tokens_per_step,
                     temperature=self.temperature
                 )
+                
+                # Record timing
+                generation_time = time.time() - start_time
+                trajectory.metadata["assistant_timings"].append({
+                    "round": round_count + 1,
+                    "generation_time_seconds": round(generation_time, 3),
+                    "timestamp": datetime.now().isoformat()
+                })
                 
                 # Debug: Log LLM output
                 if self.debug:
@@ -308,6 +345,14 @@ After receiving the observation, continue with the next thought and action until
                 for step in parsed_steps:
                     trajectory.add_step(step)
                     
+                    # Record message length for assistant messages
+                    if step.step_type in [StepType.THOUGHT, StepType.ACTION, StepType.FINAL_ANSWER]:
+                        trajectory.metadata["message_lengths"].append({
+                            "role": "assistant",
+                            "length": len(step.content),
+                            "step_type": step.step_type.value
+                        })
+                    
                     # Handle the step based on its type
                     if step.step_type == StepType.THOUGHT:
                         consecutive_thoughts += 1
@@ -315,10 +360,22 @@ After receiving the observation, continue with the next thought and action until
                         consecutive_thoughts = 0
                         
                         if step.step_type == StepType.ACTION:
+                            # Record tool call
+                            if step.tool_name:
+                                trajectory.metadata["tool_calls"].append(step.tool_name)
+                                trajectory.metadata["total_tool_calls"] += 1
+                            
                             # Execute action
                             result_step = await self._handle_action(step, trajectory)
                             if result_step:
                                 trajectory.add_step(result_step)
+                                
+                                # Record observation length
+                                trajectory.metadata["message_lengths"].append({
+                                    "role": "user",
+                                    "length": len(result_step.content),
+                                    "step_type": "action_result"
+                                })
                                 
                                 # Check if this was a termination tool
                                 if (step.tool_name and 
@@ -339,12 +396,38 @@ After receiving the observation, continue with the next thought and action until
                 
             except Exception as e:
                 logger.error(f"Error in trajectory {request_id}: {e}")
+                trajectory.metadata["error_count"] += 1
                 error_step = TrajectoryStep(
                     step_type=StepType.THOUGHT,
                     content=f"I encountered an error: {str(e)}. Let me try a different approach.",
                     metadata={"error": str(e)}
                 )
                 trajectory.add_step(error_step)
+        
+        # Finalize metadata
+        trajectory.metadata["end_time"] = datetime.now().isoformat()
+        trajectory.metadata["total_rounds"] = round_count
+        trajectory.metadata["total_steps"] = len(trajectory.steps)
+        
+        # Calculate total execution time
+        start_time = datetime.fromisoformat(trajectory.metadata["start_time"])
+        end_time = datetime.fromisoformat(trajectory.metadata["end_time"])
+        trajectory.metadata["total_execution_time_seconds"] = round((end_time - start_time).total_seconds(), 3)
+        
+        # Calculate average message lengths
+        if trajectory.metadata["message_lengths"]:
+            user_lengths = [m["length"] for m in trajectory.metadata["message_lengths"] if m["role"] == "user"]
+            assistant_lengths = [m["length"] for m in trajectory.metadata["message_lengths"] if m["role"] == "assistant"]
+            
+            trajectory.metadata["average_user_message_length"] = round(sum(user_lengths) / len(user_lengths), 2) if user_lengths else 0
+            trajectory.metadata["average_assistant_message_length"] = round(sum(assistant_lengths) / len(assistant_lengths), 2) if assistant_lengths else 0
+            trajectory.metadata["total_user_chars"] = sum(user_lengths)
+            trajectory.metadata["total_assistant_chars"] = sum(assistant_lengths)
+        
+        # Calculate average assistant response time
+        if trajectory.metadata["assistant_timings"]:
+            avg_time = sum(t["generation_time_seconds"] for t in trajectory.metadata["assistant_timings"]) / len(trajectory.metadata["assistant_timings"])
+            trajectory.metadata["average_assistant_response_time_seconds"] = round(avg_time, 3)
         
         self.finalize_trajectory(trajectory)
         return trajectory
@@ -414,10 +497,21 @@ After receiving the observation, continue with the next thought and action until
                         return [parsed_result]
                     elif isinstance(parsed_result, dict):
                         # Assume it's an action
+                        metadata = {
+                            "raw_output": output, 
+                            "custom_parsed": True
+                        }
+                        
+                        # If the parser extracted thought content, add it to metadata
+                        if parsed_result.get("thought_content"):
+                            metadata["thought_content"] = parsed_result["thought_content"]
+                            metadata["has_thought"] = True
+                            metadata["combined_output"] = True
+                        
                         return [TrajectoryStep(
                             step_type=StepType.ACTION,
                             content=output,  # Keep original LLM output as content
-                            metadata={"raw_output": output, "custom_parsed": True},
+                            metadata=metadata,
                             tool_name=parsed_result.get("tool_name"),
                             tool_args=parsed_result.get("tool_args", {})
                         )]
@@ -627,20 +721,24 @@ After receiving the observation, continue with the next thought and action until
             if not thought_content:
                 return None
             
-            # Create thought step
-            thought_step = TrajectoryStep(
-                step_type=StepType.THOUGHT,
-                content=thought_content.strip(),
-                metadata={"raw_output": output, "combined_parsing": True}
-            )
-            
-            # Parse action if present
+            # If we have both thought and action, create a single ACTION step
             if action_content.strip():
                 action_step = self._parse_json_action(action_content.strip(), output)
                 if action_step:
-                    return [thought_step, action_step]
+                    # Store thought content in metadata, but keep original output as content
+                    action_step.metadata["thought_content"] = thought_content.strip()
+                    action_step.metadata["has_thought"] = True
+                    action_step.metadata["combined_output"] = True
+                    # Keep the full original output as content
+                    action_step.content = output
+                    return [action_step]
             
-            # Return just thought if no valid action
+            # If only thought (no action), create thought step
+            thought_step = TrajectoryStep(
+                step_type=StepType.THOUGHT,
+                content=output,  # Keep full output
+                metadata={"raw_output": output, "thought_content": thought_content.strip()}
+            )
             return [thought_step]
             
         except Exception as e:
@@ -910,16 +1008,43 @@ def dump_trajectory(trajectory: Trajectory, filepath: str, format: str = "json")
     Args:
         trajectory: Trajectory to dump
         filepath: Output file path
-        format: Output format ("json" or "txt")
+        format: Output format ("json", "jsonl", or "txt")
     """
     try:
-        if format.lower() == "json":
+        if format.lower() == "jsonl":
+            # Save as JSONL format - one message per line
+            with open(filepath, 'w', encoding='utf-8') as f:
+                # First, add metadata as a special message
+                if trajectory.metadata:
+                    meta_msg = {
+                        "role": "meta",
+                        "content": json.dumps(trajectory.metadata, ensure_ascii=False),
+                        "meta": trajectory.metadata  # Also include as structured data
+                    }
+                    f.write(json.dumps(meta_msg, ensure_ascii=False) + '\n')
+                
+                # Then, add system prompt if available
+                if hasattr(trajectory, 'system_prompt') and trajectory.system_prompt:
+                    system_msg = {
+                        "role": "system",
+                        "content": trajectory.system_prompt
+                    }
+                    f.write(json.dumps(system_msg, ensure_ascii=False) + '\n')
+                
+                # Then add all trajectory messages
+                messages = trajectory.get_messages()
+                for msg in messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + '\n')
+        
+        elif format.lower() == "json":
             # Convert trajectory to JSON-serializable format
             data = {
                 "request_id": trajectory.request_id,
                 "is_completed": trajectory.is_completed,
                 "final_reward": trajectory.final_reward,
                 "total_tokens": trajectory.total_tokens,
+                "system_prompt": getattr(trajectory, 'system_prompt', None),
+                "metadata": trajectory.metadata,
                 "steps": []
             }
             
@@ -969,7 +1094,7 @@ def dump_trajectory(trajectory: Trajectory, filepath: str, format: str = "json")
                     f.write("-" * 30 + "\n\n")
         
         else:
-            raise ValueError(f"Unsupported format: {format}. Use 'json' or 'txt'")
+            raise ValueError(f"Unsupported format: {format}. Use 'json', 'jsonl', or 'txt'")
         
         logger.info(f"Trajectory dumped to {filepath} in {format} format")
         
@@ -978,4 +1103,50 @@ def dump_trajectory(trajectory: Trajectory, filepath: str, format: str = "json")
         raise
 
 
-__all__ = ['GeneralAgent', 'dump_trajectory']
+def save_trajectory_as_messages(trajectory: Trajectory, filepath: str, include_system_prompt: bool = True, include_meta: bool = True) -> None:
+    """
+    Save trajectory as a JSONL file with standard message format.
+    
+    This creates a clean conversation history that can be used for:
+    - Training data
+    - Debugging conversations
+    - Replaying trajectories
+    
+    Args:
+        trajectory: Trajectory to save
+        filepath: Output file path (should end with .jsonl)
+        include_system_prompt: Whether to include system prompt as first message
+        include_meta: Whether to include metadata as first message
+    """
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            # Optionally add metadata as first message
+            if include_meta and trajectory.metadata:
+                meta_msg = {
+                    "role": "meta",
+                    "content": json.dumps(trajectory.metadata, ensure_ascii=False),
+                    "meta": trajectory.metadata
+                }
+                f.write(json.dumps(meta_msg, ensure_ascii=False) + '\n')
+            
+            # Optionally add system prompt
+            if include_system_prompt and hasattr(trajectory, 'system_prompt') and trajectory.system_prompt:
+                system_msg = {
+                    "role": "system",
+                    "content": trajectory.system_prompt
+                }
+                f.write(json.dumps(system_msg, ensure_ascii=False) + '\n')
+            
+            # Write each message
+            messages = trajectory.get_messages()
+            for msg in messages:
+                f.write(json.dumps(msg, ensure_ascii=False) + '\n')
+        
+        logger.info(f"Trajectory saved as messages to {filepath}")
+        
+    except Exception as e:
+        logger.error(f"Failed to save trajectory as messages: {e}")
+        raise
+
+
+__all__ = ['GeneralAgent', 'dump_trajectory', 'save_trajectory_as_messages']

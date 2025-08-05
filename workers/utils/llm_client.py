@@ -59,6 +59,9 @@ class LLMAPIClient:
             Exception: If all retry attempts fail
         """
         last_exception = None
+
+        if self.debug:
+            self._log_debug_request(messages)
         
         for attempt in range(self.max_retries + 1):  # +1 for initial attempt
             try:
@@ -68,43 +71,6 @@ class LLMAPIClient:
                     logger.warning(f"🔄 重试第 {attempt} 次，延迟 {delay} 秒...")
                     await asyncio.sleep(delay)
                 
-                # 记录当前尝试
-                attempt_info = f" (尝试 {attempt + 1}/{self.max_retries + 1})" if attempt > 0 else ""
-                logger.info(f"Calling LLM API with {len(messages)} messages{attempt_info}")
-                
-                # Debug模式：记录API请求详情
-                if self.debug:
-                    print("\n" + "="*80)
-                    print(f"🔍 [DEBUG] LLM API Request{attempt_info}:")
-                    print(f"   🤖 Model: {self.model}")
-                    print(f"   📊 Max tokens: {max_tokens}")
-                    print(f"   🌡️  Temperature: {temperature}")
-                    print(f"   🔄 Max retries: {self.max_retries}")
-                    print(f"\n   💬 INPUT MESSAGES ({len(messages)}):")
-                    print("   " + "-"*60)
-                    
-                    for i, msg in enumerate(messages):
-                        role = msg.get('role', 'unknown')
-                        content = msg.get('content', '')
-                        
-                        # 高亮显示system prompt
-                        if role == 'system':
-                            print(f"\n   📌 [{i+1}] SYSTEM PROMPT:")
-                        else:
-                            print(f"\n   📝 [{i+1}] Role: {role.upper()}")
-                        
-                        print(f"   Content ({len(content)} chars):")
-                        print("   " + "-"*40)
-                        
-                        # 对content进行缩进显示
-                        content_lines = content.split('\n')
-                        for line in content_lines:
-                            print(f"   {line}")
-                        
-                        print("   " + "-"*40)
-                    
-                    print("\n   🚀 Sending request to LLM...")
-                    print("="*80)
                 
                 # 执行API调用
                 response = await self.client.chat.completions.create(
@@ -121,7 +87,6 @@ class LLMAPIClient:
                 if self.debug:
                     self._log_debug_response(response, content, attempt)
                 
-                logger.info(f"API response: {content}")
                 return content
                 
             except Exception as e:
@@ -163,40 +128,20 @@ class LLMAPIClient:
                 return str(response)
         else:
             return str(response)
-    
+
+    def _log_debug_request(self, request_messages):
+        print("Request Messages Begin")
+        for m in request_messages:
+            print("---------------------")
+            print(m)
+
+        print("Request Messages End")
+            
     def _log_debug_response(self, response, content: str, attempt: int):
         """记录详细的响应调试信息"""
         attempt_info = f" (尝试 {attempt + 1})" if attempt > 0 else ""
-        print("\n" + "="*80)
-        print(f"📤 [DEBUG] LLM API Response{attempt_info}:")
-        
-        # 显示token使用情况
-        if hasattr(response, 'usage'):
-            usage = response.usage
-            print(f"   📊 Token usage:")
-            print(f"       Prompt tokens: {usage.prompt_tokens}")
-            print(f"       Completion tokens: {usage.completion_tokens}")
-            print(f"       Total tokens: {usage.total_tokens}")
-            if hasattr(usage, 'completion_tokens_details'):
-                print(f"       Token details: {usage.completion_tokens_details}")
-        
-        # 显示响应元数据
-        if hasattr(response, 'model') and hasattr(response, 'id'):
-            print(f"   🆔 Response ID: {response.id}")
-            print(f"   🤖 Response Model: {response.model}")
-        
-        # 显示响应内容
-        print(f"\n   📝 OUTPUT CONTENT ({len(content)} chars):")
-        print("   " + "-"*60)
-        
-        # 对响应内容进行缩进显示
-        content_lines = content.split('\n')
-        for line in content_lines:
-            print(f"   {line}")
-        
-        print("   " + "-"*60)
-        print("✅ Response processing complete")
-        print("="*80)
+        print(response)
+
     
     def _should_retry_on_error(self, error: Exception, attempt: int) -> bool:
         """判断是否应该重试"""

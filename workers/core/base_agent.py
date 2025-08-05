@@ -224,6 +224,9 @@ Think step by step and use the available tools when necessary."""
         system_prompt = self.create_system_prompt()
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+            # Store system prompt in trajectory metadata for later use
+            if not hasattr(trajectory, 'system_prompt'):
+                trajectory.system_prompt = system_prompt
         
         # Add trajectory steps as messages
         messages.extend(trajectory.get_messages())
