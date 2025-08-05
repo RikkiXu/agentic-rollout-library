@@ -334,8 +334,7 @@ Reminder:
     # Create agent instance with termination tool and custom XML parser
     agent = GeneralAgent(
         max_rounds=15,
-        #debug=True,  # Enable agent debug output
-        debug=False,
+        debug=True,  # Enable agent debug output
         termination_tool_names=["r2e_submit"],  # Mark r2e_submit as termination tool
         action_parser=parse_xml_action_custom,  # Use custom XML action parser
         system_prompt=custom_system_prompt  # Pass custom prompt in constructor
@@ -381,7 +380,7 @@ Reminder:
         api_key=API_KEY,
         base_url=BASE_URL,
         model=MODEL_NAME,
-        debug=False
+        debug=True
     )
     
     try:

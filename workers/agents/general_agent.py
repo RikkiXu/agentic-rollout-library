@@ -44,6 +44,8 @@ class GeneralAgent(BaseAgent):
         termination_tool_names: Optional[List[str]] = None,
         debug: bool = False,
         action_parser: Optional[callable] = None,
+        steps_remaining_template: Optional[str] = None,
+        show_steps_remaining: bool = True,
         **kwargs
     ):
         """
@@ -56,6 +58,10 @@ class GeneralAgent(BaseAgent):
             termination_tool_names: List of tool names that signal termination
             debug: Enable debug mode to log all LLM inputs and outputs
             action_parser: Custom function to parse actions from LLM output
+            steps_remaining_template: Template for steps remaining message. 
+                                     Use {steps} placeholder for step count.
+                                     Default: "\n\nSteps Remaining: {steps}"
+            show_steps_remaining: Whether to show steps remaining in user messages
             **kwargs: Additional configuration passed to BaseAgent
         """
         super().__init__(max_steps=max_rounds * 2, **kwargs)  # *2 for thought+action pairs
@@ -66,6 +72,10 @@ class GeneralAgent(BaseAgent):
         self.termination_tool_names = termination_tool_names or ["finish"]
         self.debug = debug
         self.custom_action_parser = action_parser
+        
+        # Steps remaining configuration
+        self.show_steps_remaining = show_steps_remaining
+        self.steps_remaining_template = steps_remaining_template or "\n\nSteps Remaining: {steps}"
         
         # ReAct specific configuration
         self.require_thought_before_action = kwargs.get("require_thought_before_action", True)
@@ -177,6 +187,38 @@ After receiving the observation, continue with the next thought and action until
             
         return default_prompt
     
+    def _add_steps_remaining(self, messages: List[Dict[str, str]], current_round: int) -> List[Dict[str, str]]:
+        """
+        Add steps remaining information to the last user message.
+        
+        Args:
+            messages: List of messages
+            current_round: Current round number (0-indexed)
+            
+        Returns:
+            Modified messages list with steps remaining added
+        """
+        if not messages:
+            return messages
+        
+        # Calculate remaining steps
+        remaining_steps = self.max_rounds - current_round
+        
+        # Find the last user message and add steps remaining
+        messages_copy = messages.copy()
+        for i in range(len(messages_copy) - 1, -1, -1):
+            if messages_copy[i].get("role") == "user":
+                # Add steps remaining to the last user message
+                original_content = messages_copy[i]["content"]
+                steps_info = self.steps_remaining_template.format(steps=remaining_steps)
+                messages_copy[i] = {
+                    "role": "user",
+                    "content": original_content + steps_info
+                }
+                break
+        
+        return messages_copy
+    
     def _build_tools_documentation(self) -> str:
         """Build tools documentation using tool descriptions."""
         if not self.tools:
@@ -224,7 +266,7 @@ After receiving the observation, continue with the next thought and action until
         initial_content = self._extract_prompt_content(prompt)
         initial_step = TrajectoryStep(
             step_type=StepType.OBSERVATION,
-            content=f"Task: {initial_content}",
+            content=initial_content,  # No "Task:" prefix
             metadata={"prompt": prompt}
         )
         trajectory.add_step(initial_step)
@@ -236,6 +278,10 @@ After receiving the observation, continue with the next thought and action until
             try:
                 # Generate next step
                 messages = self.format_messages_for_llm(trajectory)
+                
+                # Add steps remaining to the last user message if enabled
+                if self.show_steps_remaining:
+                    messages = self._add_steps_remaining(messages, round_count)
                 
                 # Determine what kind of step we expect next
                 expected_step_type = self._determine_next_step_type(trajectory, consecutive_thoughts)
@@ -370,7 +416,7 @@ After receiving the observation, continue with the next thought and action until
                         # Assume it's an action
                         return [TrajectoryStep(
                             step_type=StepType.ACTION,
-                            content=output,
+                            content=output,  # Keep original LLM output as content
                             metadata={"raw_output": output, "custom_parsed": True},
                             tool_name=parsed_result.get("tool_name"),
                             tool_args=parsed_result.get("tool_args", {})
@@ -438,8 +484,8 @@ After receiving the observation, continue with the next thought and action until
             tool_name, tool_args = self._parse_tool_call(action_content)
             return TrajectoryStep(
                 step_type=StepType.ACTION,
-                content=action_content,
-                metadata={"raw_output": output},
+                content=output,  # Keep full original output including "Action:" prefix
+                metadata={"raw_output": output, "action_content": action_content},
                 tool_name=tool_name,
                 tool_args=tool_args
             )
@@ -463,7 +509,7 @@ After receiving the observation, continue with the next thought and action until
             tool_name, tool_args = self._parse_tool_call(output)
             return TrajectoryStep(
                 step_type=StepType.ACTION,
-                content=output,
+                content=output,  # Keep original output as content
                 metadata={"raw_output": output, "inferred_type": True},
                 tool_name=tool_name,
                 tool_args=tool_args
@@ -659,11 +705,11 @@ After receiving the observation, continue with the next thought and action until
                     metadata={"raw_output": full_output, "json_action": action_data}
                 )
             
-            # Create action step
+            # Create action step - keep full output as content
             return TrajectoryStep(
                 step_type=StepType.ACTION,
-                content=action_content,
-                metadata={"raw_output": full_output, "json_action": action_data},
+                content=full_output,  # Keep full original LLM output
+                metadata={"raw_output": full_output, "json_action": action_data, "parsed_action": action_content},
                 tool_name=tool_name,
                 tool_args=parameters
             )
