@@ -275,6 +275,26 @@ First explore the repository structure, understand the codebase, locate the rele
                 patch = output.strip()
                 logger.info(f"Generated patch ({len(patch)} chars)")
                 logger.debug(f"Patch preview: {patch[:500]}..." if len(patch) > 500 else f"Patch: {patch}")
+                
+                # Save patch immediately to results directory
+                patches_dir = os.path.join(self.output_dir, "patches")
+                os.makedirs(patches_dir, exist_ok=True)
+                
+                # Create patch filename with timestamp
+                patch_filename = f"{safe_instance_id}_{timestamp}.patch"
+                patch_filepath = os.path.join(patches_dir, patch_filename)
+                
+                # Write patch to file
+                with open(patch_filepath, 'w', encoding='utf-8') as f:
+                    f.write(patch)
+                logger.info(f"Saved patch to: {patch_filepath}")
+                
+                # Also save a latest version without timestamp for easy access
+                latest_patch_filepath = os.path.join(patches_dir, f"{safe_instance_id}_latest.patch")
+                with open(latest_patch_filepath, 'w', encoding='utf-8') as f:
+                    f.write(patch)
+                logger.info(f"Saved latest patch to: {latest_patch_filepath}")
+                
                 return patch
             else:
                 logger.warning(f"No patch generated or git diff failed: {output}")
@@ -340,12 +360,7 @@ First explore the repository structure, understand the codebase, locate the rele
             elif result:
                 instance_id = instance.get("instance_id", f"unknown_{i}")
                 self.patches[instance_id] = result
-                
-                # Save patch to file
-                patch_file = os.path.join(self.output_dir, f"{instance_id.replace('/', '_')}.patch")
-                with open(patch_file, 'w') as f:
-                    f.write(result)
-                logger.info(f"Saved patch to: {patch_file}")
+                # Patch is already saved in _process_instance_impl
         
         # Save summary
         summary_file = os.path.join(self.output_dir, "summary.json")
@@ -355,8 +370,13 @@ First explore the repository structure, understand the codebase, locate the rele
             "instance_ids": list(self.patches.keys()),
             "timestamp": datetime.now().isoformat(),
             "trajectory_dir": os.path.join(self.output_dir, "trajectories"),
-            "max_concurrent": self.max_concurrent
+            "patches_dir": os.path.join(self.output_dir, "patches"),
+            "max_concurrent": self.max_concurrent,
+            "profiling_enabled": self.enable_profiling
         }
+        
+        if self.enable_profiling:
+            summary["profiles_dir"] = os.path.join(self.output_dir, "profiles")
         with open(summary_file, 'w') as f:
             json.dump(summary, f, indent=2)
         logger.info(f"Saved summary to: {summary_file}")
