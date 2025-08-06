@@ -6,8 +6,8 @@ Based on the original R2E search.py.
 """
 
 import os
+import fnmatch
 import re
-import subprocess
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,11 +27,11 @@ logger = logging.getLogger(__name__)
 
 
 class R2ESearchTool(AgenticBaseTool):
-    """R2E-style search tool for finding text in files and directories."""
+    """R2E-style search tool for finding text in files."""
     
     def __init__(self, config: Dict = None):
         """Initialize R2E search tool."""
-        # Set execution mode and K8s config FIRST, before calling super().__init__
+        # Set execution mode and K8s config FIRST
         config = config or {}
         self.execution_mode = config.get("execution_mode", "local")
         self.pod_name = config.get("pod_name")
@@ -41,162 +41,178 @@ class R2ESearchTool(AgenticBaseTool):
         super().__init__(config)
         
         # R2E-specific settings
+        self.max_results = self.config.get("max_results", 100)
         self.max_files_threshold = self.config.get("max_files_threshold", 100)
-        self.python_only = self.config.get("python_only", True)
+        self.python_only = self.config.get("python_only", False)
         self.exclude_hidden = self.config.get("exclude_hidden", True)
+        self.ignore_patterns = set(self.config.get("ignore_patterns", [
+            ".git", "__pycache__", "*.pyc", ".pytest_cache"
+        ]))
+        
         self.k8s_manager = None
         
         # Validate K8s configuration if needed
         if self.execution_mode == "k8s":
             if not K8S_AVAILABLE:
-                raise ImportError("kodo library is required for K8s execution mode. Please install it from https://github.com/baidubce/kodo.git")
+                raise ImportError("kodo library is required for K8s execution mode.")
             if not self.pod_name:
                 raise ValueError("pod_name is required when execution_mode is 'k8s'")
     
+    def get_description(self) -> str:
+        """Override to provide custom description for R2E search."""
+        if self.config.get("use_custom_description", False):
+            return """–– BEGIN FUNCTION #3: search ––
+Description:
+Search for a term in a directory or a single file.
+  •    If path is a directory (or unspecified, default is .), it recursively searches all non-hidden files
+  •    If path points to a file, it runs a grep -n in that file to show line numbers
+  •    If more than 100 files match, results are truncated
+
+Parameters:
+  1.    search_term (string, required)
+The term or string to search for in files.
+  2.    path (string, optional)
+The file or directory to search in. Defaults to . if not specified.
+
+–– END FUNCTION #3 ––"""
+        
+        # Default: return JSON schema
+        return super().get_description()
+    
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
-        """Return OpenAI tool schema for R2E search tool."""
+        """Return OpenAI tool schema for R2E search."""
         execution_context = f" (executing in {self.execution_mode} mode)" if self.execution_mode != "local" else ""
         
         return create_openai_tool_schema(
             name="r2e_search",
-            description=f"Search for a term in either a directory or a single file{execution_context}. R2E-style tool with Python file focus.",
+            description=f"Search for a term in files or directories{execution_context}. R2E-style recursive search tool.",
             parameters={
                 "search_term": {
                     "type": "string",
-                    "description": "The term to search for in files"
+                    "description": "The term or string to search for in files"
                 },
                 "path": {
-                    "type": "string",
-                    "description": "The file or directory in which to search (defaults to current directory '.')"
-                },
-                "python_only": {
-                    "type": "boolean",
-                    "description": "If true, only search in .py files when searching a directory (default: true)"
+                    "type": "string", 
+                    "description": "The file or directory to search in. Defaults to current directory if not specified",
+                    "default": "."
                 }
             },
             required=["search_term"]
         )
     
     async def execute_tool(self, instance_id: str, parameters: Dict[str, Any], **kwargs) -> ToolResult:
-        """Execute search operation."""
+        """Execute search."""
         try:
             search_term = parameters["search_term"]
             path = parameters.get("path", ".")
-            python_only = parameters.get("python_only", self.python_only)
             
-            # Use appropriate method based on execution mode
+            # Choose execution mode
             if self.execution_mode == "k8s":
-                return await self._search_k8s(search_term, path, python_only)
+                return await self._search_k8s(search_term, path, self.python_only)
             else:
-                return await self._search_local(search_term, path, python_only)
+                return await self._search_local(search_term, path, self.python_only)
                 
         except Exception as e:
-            logger.error(f"R2E search execution failed: {e}")
-            return ToolResult(success=False, error=str(e))
+            logger.error(f"R2E search failed: {e}")
+            return ToolResult(
+                success=False, 
+                error=str(e),
+                result={
+                    "error_type": type(e).__name__,
+                    "error_details": str(e)
+                }
+            )
     
     async def _search_local(self, search_term: str, path_str: str, python_only: bool) -> ToolResult:
-        """Search locally (R2E-style)."""
+        """Search locally."""
         try:
-            path = Path(path_str).resolve()
+            path = Path(path_str)
             
-            # Check if path is a file or directory
-            if path.is_file():
-                return await self._search_in_file_local(search_term, path)
-            elif path.is_dir():
-                return await self._search_in_directory_local(search_term, path, python_only)
-            else:
+            if not path.exists():
                 return ToolResult(
-                    success=False, 
-                    error=f"Path '{path}' not found or not accessible."
+                    success=False,
+                    error=f"Path does not exist: {path_str}"
                 )
+            
+            if path.is_file():
+                return self._search_in_file_local(search_term, path)
+            else:
+                return self._search_in_directory_local(search_term, path, python_only)
                 
         except Exception as e:
             return ToolResult(success=False, error=str(e))
     
-    async def _search_in_file_local(self, search_term: str, filepath: Path) -> ToolResult:
-        """Search in a single file using grep (R2E-style)."""
+    def _search_in_file_local(self, search_term: str, filepath: Path) -> ToolResult:
+        """Search in a single file locally."""
         try:
-            # Use grep -n for line numbers
-            cmd = ["grep", "-n", search_term, str(filepath)]
+            matches = []
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                for line_num, line in enumerate(f, 1):
+                    if search_term in line:
+                        matches.append(f"{line_num}: {line.strip()}")
             
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True
-                )
-            except TypeError:
-                # Fallback for Python 3.5/3.6
-                result = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True
-                )
-            
-            if result.returncode == 1:
-                # No matches found
+            if not matches:
                 output = f'No matches found for "{search_term}" in {filepath}'
                 return ToolResult(
                     success=True,
                     result={"output": output, "matches": 0}
                 )
-            elif result.returncode != 0:
-                # Error
-                return ToolResult(
-                    success=False,
-                    error=f"Error executing grep: {result.stderr}"
-                )
             
             # Format output
-            output_lines = [f'Matches for "{search_term}" in {filepath}:']
-            output_lines.append(result.stdout.strip())
-            output = "\n".join(output_lines)
+            output_lines = [f'Found {len(matches)} matches for "{search_term}" in {filepath}:']
+            for match in matches[:20]:  # Limit display
+                output_lines.append(f"line {match}")
             
-            # Count matches
-            num_matches = len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
+            if len(matches) > 20:
+                output_lines.append(f"... and {len(matches) - 20} more matches")
+            
+            output = "\n".join(output_lines)
             
             return ToolResult(
                 success=True,
                 result={
                     "output": output,
-                    "matches": num_matches,
-                    "file": str(filepath)
+                    "matches": len(matches)
                 }
             )
             
-        except FileNotFoundError:
-            return ToolResult(
-                success=False,
-                error="`grep` is not available on this system. Please install or use another method."
-            )
         except Exception as e:
             return ToolResult(success=False, error=str(e))
     
-    async def _search_in_directory_local(self, search_term: str, directory: Path, python_only: bool) -> ToolResult:
-        """Search in directory (R2E-style)."""
+    def _search_in_directory_local(self, search_term: str, directory: Path, python_only: bool) -> ToolResult:
+        """Search in directory locally."""
         try:
             matches = {}
             num_files_matched = 0
             
+            # Walk directory
             for root, dirs, files in os.walk(directory):
-                # Exclude hidden directories
+                # Skip hidden directories
                 if self.exclude_hidden:
-                    dirs[:] = [d for d in dirs if not d.startswith(".")]
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
                 
-                for file in files:
+                # Skip ignored patterns
+                dirs[:] = [d for d in dirs if not any(fnmatch.fnmatch(d, p) for p in self.ignore_patterns)]
+                
+                for filename in files:
                     # Skip hidden files
-                    if self.exclude_hidden and file.startswith("."):
+                    if self.exclude_hidden and filename.startswith('.'):
                         continue
                     
-                    # If python_only is set, only search .py files
-                    if python_only and not file.endswith(".py"):
+                    # Skip ignored patterns
+                    if any(fnmatch.fnmatch(filename, p) for p in self.ignore_patterns):
                         continue
                     
-                    filepath = Path(root) / file
+                    # Check if we should search this file
+                    if python_only and not filename.endswith('.py'):
+                        continue
+                    
+                    filepath = Path(root) / filename
+                    
+                    # Search in file
                     try:
-                        with open(filepath, "r", errors="ignore") as f:
-                            file_matches = 0
+                        file_matches = 0
+                        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                             for line_num, line in enumerate(f, 1):
                                 if search_term in line:
                                     file_matches += 1
@@ -301,169 +317,144 @@ class R2ESearchTool(AgenticBaseTool):
             }
     
     async def _search_k8s(self, search_term: str, path_str: str, python_only: bool) -> ToolResult:
-        """Search in K8s pod."""
+        """Search in K8s pod with optimized command execution."""
         try:
-            # Check if path exists and determine type
-            # Note: This command always returns exit code 0 because of the || echo structure
-            path_check_cmd = f"if [ -f '{path_str}' ]; then echo 'file'; elif [ -d '{path_str}' ]; then echo 'dir'; else echo 'none'; fi"
-            path_check = await self._exec_command(path_check_cmd)
+            # Escape single quotes in search term and path
+            escaped_term = search_term.replace("'", "'\"'\"'")
+            escaped_path = path_str.replace("'", "'\"'\"'")
             
-            # Check if command execution itself failed (not just the test)
-            # Note: Return codes 0, 1, 2 are all valid for shell test commands
-            # 0 = true/success, 1 = false/failure, 2 = usage error (but still valid response)
-            # We should only fail if we get other error codes or no stdout
-            if path_check["return_code"] not in [0, 1, 2] or not path_check.get("stdout"):
-                error_msg = f"Failed to check path '{path_str}'. Command failed with return code: {path_check.get('return_code', 'N/A')}, stderr: {path_check.get('stderr', '')}"
-                logger.error(error_msg)
-                return ToolResult(success=False, error=error_msg)
+            # Combine all operations into a single command to minimize pod executions
+            # This command will:
+            # 1. Check if path exists
+            # 2. Determine if it's a file or directory
+            # 3. Execute the appropriate search command
+            # 4. Return results in a parseable format
             
-            path_type = path_check["stdout"].strip()
+            if python_only:
+                # For Python-only search in directories
+                combined_cmd = f"""
+if [ ! -e '{escaped_path}' ]; then
+    echo "ERROR: Path not found"
+    exit 1
+elif [ -f '{escaped_path}' ]; then
+    echo "TYPE: file"
+    grep -n '{escaped_term}' '{escaped_path}' 2>/dev/null || echo "NO_MATCHES"
+elif [ -d '{escaped_path}' ]; then
+    echo "TYPE: directory"
+    find '{escaped_path}' -type f -name '*.py' | head -100 | while read -r file; do
+        if grep -l '{escaped_term}' "$file" 2>/dev/null; then
+            echo "$file"
+        fi
+    done | head -100 || echo "NO_MATCHES"
+else
+    echo "ERROR: Unknown path type"
+    exit 1
+fi
+"""
+            else:
+                # For general search (all files)
+                combined_cmd = f"""
+if [ ! -e '{escaped_path}' ]; then
+    echo "ERROR: Path not found"
+    exit 1
+elif [ -f '{escaped_path}' ]; then
+    echo "TYPE: file"
+    grep -n '{escaped_term}' '{escaped_path}' 2>/dev/null || echo "NO_MATCHES"
+elif [ -d '{escaped_path}' ]; then
+    echo "TYPE: directory"
+    grep -r -l '{escaped_term}' '{escaped_path}' 2>/dev/null | head -100 || echo "NO_MATCHES"
+else
+    echo "ERROR: Unknown path type"
+    exit 1
+fi
+"""
             
-            if path_type == "none":
-                return ToolResult(
-                    success=False,
-                    error=f"Path '{path_str}' not found or not accessible."
-                )
-            elif path_type == "file":
-                return await self._search_in_file_k8s(search_term, path_str)
-            else:  # directory
-                return await self._search_in_directory_k8s(search_term, path_str, python_only)
+            # Execute the combined command
+            result = await self._exec_command(combined_cmd)
+            
+            if not result["success"]:
+                error_output = result.get("stdout", "").strip()
+                if error_output.startswith("ERROR:"):
+                    error_msg = error_output.replace("ERROR:", "").strip()
+                    return ToolResult(success=False, error=f"{error_msg}: {path_str}")
+                else:
+                    return ToolResult(success=False, error=f"Command execution failed: {result.get('stderr', '')}")
+            
+            # Parse the output
+            output_lines = result["stdout"].strip().split('\n')
+            if not output_lines:
+                return ToolResult(success=False, error="No output from search command")
+            
+            # First line tells us the type
+            type_line = output_lines[0]
+            if type_line == "TYPE: file":
+                # File search results
+                if len(output_lines) == 2 and output_lines[1] == "NO_MATCHES":
+                    return ToolResult(
+                        success=True,
+                        result={
+                            "output": f'No matches found for "{search_term}" in {path_str}',
+                            "matches": 0
+                        }
+                    )
+                else:
+                    # Process grep -n output
+                    matches = output_lines[1:]
+                    output = f'Found {len(matches)} matches for "{search_term}" in {path_str}:\n'
+                    for match in matches[:20]:  # Limit display
+                        output += match + '\n'
+                    if len(matches) > 20:
+                        output += f'... and {len(matches) - 20} more matches'
+                    return ToolResult(
+                        success=True,
+                        result={
+                            "output": output.strip(),
+                            "matches": len(matches)
+                        }
+                    )
+            elif type_line == "TYPE: directory":
+                # Directory search results
+                if len(output_lines) == 2 and output_lines[1] == "NO_MATCHES":
+                    return ToolResult(
+                        success=True,
+                        result={
+                            "output": f'No matches found for "{search_term}" in {path_str}',
+                            "matches": 0
+                        }
+                    )
+                else:
+                    # Process file list
+                    matched_files = [f for f in output_lines[1:] if f and f != "NO_MATCHES"]
+                    
+                    if len(matched_files) >= 100:
+                        output = f'Found more than 100 files matching "{search_term}" in {path_str}. Please narrow your search.'
+                    else:
+                        output = f'Found {len(matched_files)} files matching "{search_term}" in {path_str}:\n'
+                        for filepath in matched_files:
+                            output += filepath + '\n'
+                    
+                    return ToolResult(
+                        success=True,
+                        result={
+                            "output": output.strip(),
+                            "files_matched": len(matched_files)
+                        }
+                    )
+            else:
+                return ToolResult(success=False, error=f"Unexpected output format: {type_line}")
                 
         except Exception as e:
             return ToolResult(success=False, error=str(e))
-    
-    async def _search_in_file_k8s(self, search_term: str, filepath: str) -> ToolResult:
-        """Search in a single file in K8s pod."""
-        # Escape single quotes in search term
-        escaped_term = search_term.replace("'", "'\"'\"'")
-        
-        cmd = f"grep -n '{escaped_term}' '{filepath}'"
-        result = await self._exec_command(cmd)
-        
-        if result["return_code"] == 1:
-            # No matches found
-            output = f'No matches found for "{search_term}" in {filepath}'
-            return ToolResult(
-                success=True,
-                result={"output": output, "matches": 0}
-            )
-        elif not result["success"]:
-            # Error
-            return ToolResult(
-                success=False,
-                error=f"Error executing grep: {result['stderr']}"
-            )
-        
-        # Format output
-        output_lines = [f'Matches for "{search_term}" in {filepath}:']
-        output_lines.append(result["stdout"].strip())
-        output = "\n".join(output_lines)
-        
-        # Count matches
-        num_matches = len(result["stdout"].strip().split("\n")) if result["stdout"].strip() else 0
-        
-        return ToolResult(
-            success=True,
-            result={
-                "output": output,
-                "matches": num_matches,
-                "file": filepath
-            }
-        )
-    
-    async def _search_in_directory_k8s(self, search_term: str, directory: str, python_only: bool) -> ToolResult:
-        """Search in directory in K8s pod."""
-        # Build find command
-        find_cmd = f"find '{directory}' -type f"
-        
-        if self.exclude_hidden:
-            find_cmd += " -not -path '*/.*'"
-        
-        if python_only:
-            find_cmd += " -name '*.py'"
-        
-        # Get list of files
-        files_result = await self._exec_command(find_cmd)
-        if not files_result["success"]:
-            return ToolResult(success=False, error=f"Failed to list files: {files_result['stderr']}")
-        
-        files = [f.strip() for f in files_result["stdout"].strip().split("\n") if f.strip()]
-        
-        # Search in each file
-        matches = {}
-        num_files_matched = 0
-        escaped_term = search_term.replace("'", "'\"'\"'")
-        
-        for filepath in files:
-            # Count matches in file
-            count_cmd = f"grep -c '{escaped_term}' '{filepath}' 2>/dev/null || echo 0"
-            count_result = await self._exec_command(count_cmd)
-            
-            if count_result["success"]:
-                try:
-                    count = int(count_result["stdout"].strip())
-                    if count > 0:
-                        matches[filepath] = count
-                        num_files_matched += 1
-                except ValueError:
-                    continue
-        
-        if not matches:
-            output = f'No matches found for "{search_term}" in {directory}'
-            return ToolResult(
-                success=True,
-                result={"output": output, "matches": 0}
-            )
-        
-        # Check threshold
-        if num_files_matched > self.max_files_threshold:
-            output = (
-                f'More than {num_files_matched} files matched for "{search_term}" in {directory}. '
-                "Please narrow your search."
-            )
-            return ToolResult(
-                success=True,
-                result={"output": output, "matches": sum(matches.values())}
-            )
-        
-        # Format output
-        num_matches = sum(matches.values())
-        output_lines = [f'Found {num_matches} matches for "{search_term}" in {directory}:']
-        
-        # Get current working directory for relative paths
-        pwd_result = await self._exec_command("pwd")
-        cwd = pwd_result["stdout"].strip() if pwd_result["success"] else directory
-        
-        # Print matched files
-        for filepath, count in matches.items():
-            # Try to make relative path
-            if filepath.startswith(cwd):
-                relative_path = filepath[len(cwd):].lstrip('/')
-                relative_path = f"./{relative_path}" if relative_path else "."
-            else:
-                relative_path = filepath
-            
-            output_lines.append(f"{relative_path} ({count} matches)")
-        
-        output_lines.append(f'End of matches for "{search_term}" in {directory}')
-        output = "\n".join(output_lines)
-        
-        return ToolResult(
-            success=True,
-            result={
-                "output": output,
-                "matches": num_matches,
-                "files_matched": num_files_matched
-            }
-        )
     
     def get_execution_info(self) -> Dict[str, Any]:
         """Get information about the execution environment."""
         info = {
             "execution_mode": self.execution_mode,
+            "max_results": self.max_results,
             "max_files_threshold": self.max_files_threshold,
             "python_only": self.python_only,
             "exclude_hidden": self.exclude_hidden,
+            "ignore_patterns": list(self.ignore_patterns),
             "tool_style": "R2E"
         }
         

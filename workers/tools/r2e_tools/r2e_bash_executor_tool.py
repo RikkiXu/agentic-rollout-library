@@ -123,12 +123,38 @@ The bash command (and optional arguments) to execute.
             formatted_output = "\n".join(output_parts)
             
             if result["return_code"] != 0:
+                # Create detailed error message based on exit code
+                exit_code = result["return_code"]
+                error_msg = f"Command failed with exit code {exit_code}"
+                
+                # Add common exit code explanations
+                if exit_code == 127:
+                    error_msg += " (Command not found)"
+                    error_msg += "\nThis usually means:"
+                    error_msg += "\n- The command/program doesn't exist"
+                    error_msg += "\n- The command is not in PATH"
+                    error_msg += "\n- For 'python', try 'python3' instead"
+                elif exit_code == 126:
+                    error_msg += " (Permission denied - cannot execute)"
+                elif exit_code == 1:
+                    error_msg += " (General error)"
+                elif exit_code == 2:
+                    error_msg += " (Misuse of shell command)"
+                
+                if result["stderr"]:
+                    error_msg += f"\n\nSTDERR: {result['stderr']}"
+                
+                # Add stdout if available (sometimes errors appear in stdout)
+                if result["stdout"]:
+                    error_msg += f"\n\nSTDOUT: {result['stdout']}"
+                
                 return ToolResult(
                     success=False,
-                    error=f"Error executing command:",
+                    error=error_msg,
                     result={
                         "output": formatted_output,
-                        "return_code": result["return_code"]
+                        "return_code": result["return_code"],
+                        "command": command
                     }
                 )
             else:
@@ -136,13 +162,21 @@ The bash command (and optional arguments) to execute.
                     success=True,
                     result={
                         "output": formatted_output,
-                        "return_code": result["return_code"]
+                        "return_code": result["return_code"],
+                        "command": command
                     }
                 )
                 
         except Exception as e:
-            logger.error(f"R2E bash execution failed: {e}")
-            return ToolResult(success=False, error=str(e))
+            logger.error(f"R2E bash execution failed: {e}", exc_info=True)
+            return ToolResult(
+                success=False, 
+                error=f"Tool execution error: {str(e)}\nCommand: {parameters.get('command', 'N/A')}",
+                result={
+                    "error_type": type(e).__name__,
+                    "error_details": str(e)
+                }
+            )
     
     async def _run_local_command(self, command: str) -> Dict[str, Any]:
         """Run bash command locally (R2E-style)."""
@@ -200,8 +234,14 @@ The bash command (and optional arguments) to execute.
         try:
             k8s_mgr = self._get_k8s_manager()
             
+            logger.info(f"Executing command in K8s pod {self.pod_name}: {command}")
+            
             # Execute command in pod using kodo API
             output, exit_code = k8s_mgr.execute_command(self.pod_name, command)
+            
+            # Log raw output for debugging
+            logger.debug(f"Raw K8s output: {output}")
+            logger.debug(f"Raw K8s exit code: {exit_code}")
             
             # Convert exit_code to int if it's a string
             if isinstance(exit_code, str):
@@ -219,17 +259,24 @@ The bash command (and optional arguments) to execute.
             else:
                 exit_code_int = exit_code
             
+            # Check if output contains error information
+            stderr_output = ""
+            if exit_code_int != 0 and output:
+                # Sometimes errors are mixed in stdout when using kubectl exec
+                stderr_output = output if "error" in output.lower() or "exception" in output.lower() else ""
+            
             return {
                 "stdout": output,
-                "stderr": "",  # kodo API doesn't separate stderr
+                "stderr": stderr_output,
                 "return_code": exit_code_int
             }
             
         except Exception as e:
-            logger.error(f"K8s command execution failed: {e}")
+            logger.error(f"K8s command execution failed for pod {self.pod_name}: {e}", exc_info=True)
+            error_details = f"K8s execution error: {str(e)}\nPod: {self.pod_name}\nNamespace: {self.namespace}\nCommand: {command}"
             return {
                 "stdout": "",
-                "stderr": f"K8s execution error: {str(e)}",
+                "stderr": error_details,
                 "return_code": -1
             }
     

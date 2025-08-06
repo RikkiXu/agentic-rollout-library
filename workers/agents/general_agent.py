@@ -14,6 +14,7 @@ from datetime import datetime
 from ..core.base_agent import BaseAgent
 from ..core.registry import register_agent
 from ..core.trajectory import Trajectory, TrajectoryStep, StepType
+from ..core.profiler import RolloutProfiler, EventType, get_profiler
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class GeneralAgent(BaseAgent):
         action_parser: Optional[callable] = None,
         steps_remaining_template: Optional[str] = None,
         show_steps_remaining: bool = True,
+        profiler: Optional[RolloutProfiler] = None,
         **kwargs
     ):
         """
@@ -64,6 +66,7 @@ class GeneralAgent(BaseAgent):
                                      Use {steps} placeholder for step count.
                                      Default: "\n\nSteps Remaining: {steps}"
             show_steps_remaining: Whether to show steps remaining in user messages
+            profiler: Optional profiler instance for performance tracking
             **kwargs: Additional configuration passed to BaseAgent
         """
         super().__init__(max_steps=max_rounds * 2, **kwargs)  # *2 for thought+action pairs
@@ -82,6 +85,9 @@ class GeneralAgent(BaseAgent):
         # ReAct specific configuration
         self.require_thought_before_action = kwargs.get("require_thought_before_action", True)
         self.max_consecutive_thoughts = kwargs.get("max_consecutive_thoughts", 3)
+        
+        # Performance profiler
+        self.profiler = profiler
         
         logger.info(f"Initialized GeneralAgent with max_rounds={max_rounds}")
     
@@ -262,6 +268,18 @@ After receiving the observation, continue with the next thought and action until
         **kwargs
     ) -> Trajectory:
         """Run a complete ReAct trajectory."""
+        # Get profiler instance (use provided or global)
+        profiler = self.profiler or get_profiler()
+        
+        # Start trajectory profiling
+        trajectory_event_id = None
+        if profiler.enabled:
+            trajectory_event_id = profiler.start_event(
+                f"trajectory_{request_id}",
+                EventType.TRAJECTORY_STEP,
+                {"request_id": request_id}
+            )
+        
         trajectory = Trajectory(request_id=request_id)
         
         # Initialize trajectory metadata
@@ -319,12 +337,21 @@ After receiving the observation, continue with the next thought and action until
                 # Time the LLM generation
                 start_time = time.time()
                 
-                # Generate response
-                response = await llm_generate_func(
-                    messages,
-                    max_tokens=self.max_tokens_per_step,
-                    temperature=self.temperature
-                )
+                # Generate response with profiling
+                async with profiler.profile_async(
+                    f"llm_call_round_{round_count + 1}",
+                    EventType.LLM_CALL,
+                    {
+                        "round": round_count + 1,
+                        "model": trajectory.metadata.get("model", "unknown"),
+                        "expected_step_type": expected_step_type.value if expected_step_type else None
+                    }
+                ):
+                    response = await llm_generate_func(
+                        messages,
+                        max_tokens=self.max_tokens_per_step,
+                        temperature=self.temperature
+                    )
                 
                 # Record timing
                 generation_time = time.time() - start_time
@@ -339,7 +366,12 @@ After receiving the observation, continue with the next thought and action until
                     self._log_llm_output(response, round_count + 1)
                 
                 # Parse the response (may contain multiple steps)
-                parsed_steps = self._parse_react_response(response, expected_step_type)
+                with profiler.profile(
+                    f"action_parsing_round_{round_count + 1}",
+                    EventType.ACTION_PARSING,
+                    {"round": round_count + 1}
+                ):
+                    parsed_steps = self._parse_react_response(response, expected_step_type)
                 
                 # Process each parsed step
                 for step in parsed_steps:
@@ -430,6 +462,15 @@ After receiving the observation, continue with the next thought and action until
             trajectory.metadata["average_assistant_response_time_seconds"] = round(avg_time, 3)
         
         self.finalize_trajectory(trajectory)
+        
+        # End trajectory profiling
+        if trajectory_event_id:
+            profiler.end_event(trajectory_event_id)
+        
+        # Add profiler data to trajectory metadata if enabled
+        if profiler.enabled and profiler.events:
+            trajectory.metadata["profiler_summary"] = profiler.get_summary()
+        
         return trajectory
     
     def _extract_prompt_content(self, prompt: Union[str, Dict[str, Any]]) -> str:
@@ -953,6 +994,9 @@ After receiving the observation, continue with the next thought and action until
     
     async def _handle_action(self, action_step: TrajectoryStep, trajectory: Trajectory) -> Optional[TrajectoryStep]:
         """Handle action step execution using the existing tool system."""
+        # Get profiler instance
+        profiler = self.profiler or get_profiler()
+        
         if not action_step.tool_name:
             # No valid tool call found
             return TrajectoryStep(
@@ -978,12 +1022,32 @@ After receiving the observation, continue with the next thought and action until
             print(f"   Tool Args: {json.dumps(action_step.tool_args or {}, indent=2)}")
             print("="*80)
         
-        # Use the existing execute_tool_call method from BaseAgent
-        result_step = await self.execute_tool_call(
-            action_step.tool_name,
-            action_step.tool_args or {},
-            trajectory
-        )
+        # Use the existing execute_tool_call method from BaseAgent with profiling
+        tool_event_type = EventType.TOOL_EXECUTION
+        
+        # Map specific tool types to more specific event types
+        if "bash" in action_step.tool_name.lower():
+            tool_event_type = EventType.BASH_COMMAND
+        elif "file" in action_step.tool_name.lower() and "read" in action_step.tool_name.lower():
+            tool_event_type = EventType.FILE_READ
+        elif "file" in action_step.tool_name.lower() and ("write" in action_step.tool_name.lower() or "edit" in action_step.tool_name.lower()):
+            tool_event_type = EventType.FILE_WRITE
+        elif "search" in action_step.tool_name.lower():
+            tool_event_type = EventType.SEARCH_OPERATION
+        
+        async with profiler.profile_async(
+            f"tool_{action_step.tool_name}",
+            tool_event_type,
+            {
+                "tool_name": action_step.tool_name,
+                "tool_args": action_step.tool_args
+            }
+        ):
+            result_step = await self.execute_tool_call(
+                action_step.tool_name,
+                action_step.tool_args or {},
+                trajectory
+            )
         
         # Debug: Print tool result
         if self.debug:

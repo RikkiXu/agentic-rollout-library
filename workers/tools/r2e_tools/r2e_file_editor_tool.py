@@ -11,6 +11,7 @@ import logging
 import subprocess
 import chardet
 import ast
+import base64
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -201,8 +202,19 @@ Required for the insert command. The new_str will be inserted after the line num
                 return ToolResult(success=False, error=f"Unknown command: {command}")
                 
         except Exception as e:
-            logger.error(f"R2E file editor execution failed: {e}")
-            return ToolResult(success=False, error=str(e))
+            logger.error(f"R2E file editor execution failed: {e}", exc_info=True)
+            error_msg = f"Tool execution error: {str(e)}"
+            if "parameters" in locals():
+                error_msg += f"\nCommand: {parameters.get('command', 'N/A')}"
+                error_msg += f"\nPath: {parameters.get('path', 'N/A')}"
+            return ToolResult(
+                success=False, 
+                error=error_msg,
+                result={
+                    "error_type": type(e).__name__,
+                    "error_details": str(e)
+                }
+            )
     
     async def _view(self, path_str: str, view_range: Optional[List[int]], concise: bool) -> ToolResult:
         """View file or directory contents."""
@@ -522,23 +534,44 @@ Required for the insert command. The new_str will be inserted after the line num
                 file_content = cat_result["stdout"]
                 lines = file_content.splitlines()
                 
-                # Apply view range
-                if view_range:
-                    lines = self._apply_view_range_to_lines(lines, view_range)
-                
-                # Format output
+                # Apply view range and format output with correct line numbers
                 output = f"Here's the result of running `cat -n` on the file: {path_str}:\n"
-                for i, line in enumerate(lines, 1):
-                    output += f"{i:6d} {line}\n"
+                
+                if view_range and len(view_range) == 2:
+                    start_line = view_range[0] - 1  # Convert to 0-based index
+                    end_line = view_range[1] if view_range[1] != -1 else len(lines)
+                    
+                    # Validate range
+                    if 0 <= start_line < len(lines):
+                        for i in range(start_line, min(end_line, len(lines))):
+                            output += f"{i+1:6d} {lines[i]}\n"
+                    else:
+                        output += "[Invalid view range]\n"
+                else:
+                    # No view range, show all lines
+                    for i, line in enumerate(lines):
+                        output += f"{i+1:6d} {line}\n"
+                
+                if not lines:
+                    output += "[Empty file]\n"
                 
                 output = self._maybe_truncate(output)
+                
+                # Calculate actual displayed lines count
+                if view_range and len(view_range) == 2:
+                    start_line = view_range[0] - 1
+                    end_line = view_range[1] if view_range[1] != -1 else len(lines)
+                    displayed_lines = max(0, min(end_line, len(lines)) - max(0, start_line))
+                else:
+                    displayed_lines = len(lines)
                 
                 return ToolResult(
                     success=True,
                     result={
                         "output": output,
                         "type": "file",
-                        "total_lines": len(lines)
+                        "total_lines": displayed_lines,
+                        "file_total_lines": len(lines)
                     }
                 )
                 
@@ -560,10 +593,15 @@ Required for the insert command. The new_str will be inserted after the line num
                 if not mkdir_result["success"]:
                     return ToolResult(success=False, error=f"Failed to create parent directories: {mkdir_result['stderr']}")
             
-            # Write file using cat with heredoc
-            write_result = await self._exec_command(f"cat > '{path_str}' << 'EOF'\n{file_text}\nEOF")
+            # Write file using base64 to handle special characters safely
+            encoded_text = base64.b64encode(file_text.encode('utf-8')).decode('ascii')
+            write_result = await self._exec_command(f"echo '{encoded_text}' | base64 -d > '{path_str}'")
             if not write_result["success"]:
-                return ToolResult(success=False, error=f"Failed to create file: {write_result['stderr']}")
+                # Fallback: try with printf
+                escaped_text = file_text.replace("'", "'\"'\"'").replace("\\", "\\\\")
+                write_result = await self._exec_command(f"printf '%s' '{escaped_text}' > '{path_str}'")
+                if not write_result["success"]:
+                    return ToolResult(success=False, error=f"Failed to create file: {write_result['stderr']}")
             
             # Format output
             output = f"File created at {path_str}. "
@@ -600,10 +638,15 @@ Required for the insert command. The new_str will be inserted after the line num
             # Replace
             updated_text = file_content.replace(old_str, new_str)
             
-            # Write back
-            write_result = await self._exec_command(f"cat > '{path_str}' << 'EOF'\n{updated_text}\nEOF")
+            # Write back using base64 to handle special characters
+            encoded_text = base64.b64encode(updated_text.encode('utf-8')).decode('ascii')
+            write_result = await self._exec_command(f"echo '{encoded_text}' | base64 -d > '{path_str}'")
             if not write_result["success"]:
-                return ToolResult(success=False, error=f"Failed to write file: {write_result['stderr']}")
+                # Fallback: try with printf
+                escaped_text = updated_text.replace("'", "'\"'\"'").replace("\\", "\\\\")
+                write_result = await self._exec_command(f"printf '%s' '{escaped_text}' > '{path_str}'")
+                if not write_result["success"]:
+                    return ToolResult(success=False, error=f"Failed to write file: {write_result['stderr']}")
             
             # Create snippet
             replacement_line = file_content.split(old_str)[0].count("\n")
@@ -642,10 +685,15 @@ Required for the insert command. The new_str will be inserted after the line num
             updated_lines = file_lines[:insert_line] + new_lines + file_lines[insert_line:]
             updated_text = "\n".join(updated_lines)
             
-            # Write back
-            write_result = await self._exec_command(f"cat > '{path_str}' << 'EOF'\n{updated_text}\nEOF")
+            # Write back using base64 to handle special characters
+            encoded_text = base64.b64encode(updated_text.encode('utf-8')).decode('ascii')
+            write_result = await self._exec_command(f"echo '{encoded_text}' | base64 -d > '{path_str}'")
             if not write_result["success"]:
-                return ToolResult(success=False, error=f"Failed to write file: {write_result['stderr']}")
+                # Fallback: try with printf
+                escaped_text = updated_text.replace("'", "'\"'\"'").replace("\\", "\\\\")
+                write_result = await self._exec_command(f"printf '%s' '{escaped_text}' > '{path_str}'")
+                if not write_result["success"]:
+                    return ToolResult(success=False, error=f"Failed to write file: {write_result['stderr']}")
             
             # Create snippet
             snippet_lines = (
@@ -730,16 +778,6 @@ Required for the insert command. The new_str will be inserted after the line num
         
         return result
     
-    def _apply_view_range_to_lines(self, lines: List[str], view_range: List[int]) -> List[str]:
-        """Apply view range to simple line list."""
-        if not view_range or len(view_range) != 2:
-            return lines
-        
-        start, end = view_range
-        if end == -1:
-            return lines[start-1:]
-        else:
-            return lines[start-1:end]
     
     def _lint_check(self, content: str) -> Optional[str]:
         """Check Python syntax."""
@@ -852,19 +890,20 @@ Required for the insert command. The new_str will be inserted after the line num
             else:
                 exit_code_int = exit_code
             
+            # Return consistent format
             return {
                 "success": exit_code_int == 0,
-                "stdout": output,
-                "stderr": "",
-                "return_code": exit_code_int
+                "stdout": output if output else "",
+                "stderr": "" if exit_code_int == 0 else f"Command failed with exit code {exit_code_int}",
+                "exit_code": exit_code_int
             }
         except Exception as e:
-            logger.error(f"K8s command execution failed: {e}")
+            logger.error(f"K8s command execution failed: {e}", exc_info=True)
             return {
                 "success": False,
                 "stdout": "",
                 "stderr": str(e),
-                "return_code": -1
+                "exit_code": -1
             }
     
     def get_execution_info(self) -> Dict[str, Any]:

@@ -114,16 +114,32 @@ class LLMAPIClient:
     def _extract_response_content(self, response) -> str:
         """从响应中提取内容"""
         if hasattr(response, 'choices') and response.choices:
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+            if content is None:
+                logger.warning("Response content is None, returning empty string")
+                return ""
+            return content
         elif isinstance(response, str):
             return response
         elif isinstance(response, dict):
             if 'choices' in response and response['choices']:
-                return response['choices'][0]['message']['content']
+                content = response['choices'][0]['message']['content']
+                if content is None:
+                    logger.warning("Response content is None, returning empty string")
+                    return ""
+                return content
             elif 'content' in response:
-                return response['content']
+                content = response['content']
+                if content is None:
+                    logger.warning("Response content is None, returning empty string")
+                    return ""
+                return content
             elif 'message' in response:
-                return response['message']
+                message = response['message']
+                if message is None:
+                    logger.warning("Response message is None, returning empty string")
+                    return ""
+                return message
             else:
                 return str(response)
         else:

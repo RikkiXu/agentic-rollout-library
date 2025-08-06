@@ -22,10 +22,12 @@ except ImportError:
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from workers.agents.general_agent import GeneralAgent
+from workers.agents.general_agent import GeneralAgent, dump_trajectory
 from workers.core import create_tool
 from workers.utils import create_llm_client
 from workers.core.trajectory import TrajectoryStep, StepType
+from workers.core.profiler import RolloutProfiler
+from workers.core.profiler_visualizer import ProfilerVisualizer
 import logging
 import re
 
@@ -56,17 +58,24 @@ from test_r2e_general_agent import (
 class SWEBenchRunner:
     """Runner for SWE-bench-verified instances."""
     
-    def __init__(self, namespace: str = "default", kubeconfig_path: Optional[str] = None):
+    def __init__(self, namespace: str = "default", kubeconfig_path: Optional[str] = None, output_dir: str = "./swe_patches", max_concurrent: int = 1, enable_profiling: bool = False):
         """Initialize the SWE-bench runner.
         
         Args:
             namespace: Kubernetes namespace to use
             kubeconfig_path: Path to kubeconfig file (optional)
+            output_dir: Directory to save outputs
+            max_concurrent: Maximum number of concurrent instances to process
+            enable_profiling: Enable performance profiling for each instance
         """
         self.namespace = namespace
         self.kubeconfig_path = kubeconfig_path
         self.kodo_runner = None
         self.patches = {}  # Store patches by instance_id
+        self.output_dir = output_dir
+        self.max_concurrent = max_concurrent
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.enable_profiling = enable_profiling
         
     def _init_kodo(self):
         """Initialize kodo ContainerRunner."""
@@ -87,8 +96,13 @@ class SWEBenchRunner:
         Returns:
             The patch string if successful, None otherwise
         """
+        async with self.semaphore:  # Limit concurrent executions
+            return await self._process_instance_impl(instance)
+    
+    async def _process_instance_impl(self, instance: Dict[str, Any]) -> Optional[str]:
+        """Internal implementation of process_instance."""
         instance_id = instance.get("instance_id", "unknown")
-        issue = instance.get("issue", "")
+        issue = instance.get("problem_statement", "")
         image = instance.get("image", "")
         
         if not all([instance_id, issue, image]):
@@ -116,14 +130,18 @@ class SWEBenchRunner:
                 name=pod_name,
                 environment={
                     "PYTHONPATH": "/testbed",
-                    "SWE_INSTANCE_ID": instance_id
+                    "SWE_INSTANCE_ID": instance_id,
+                    "http_proxy": "http://agent.baidu.com:8891",
+                    "https_proxy": "http://agent.baidu.com:8891",
+                    "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
+                    "PIP_TRUSTED_HOST": "pip.baidu.com"
                 }
             )
             logger.info(f"Pod {pod_name} started successfully")
             
             # Wait for pod to be ready
             await asyncio.sleep(5)
-            
+            output, exit_code = self.kodo_runner.execute_command(pod, f"ln -s /opt/miniconda3/envs/testbed /root/.venv")
             # 2. Initialize git repo to track changes
             logger.info("Initializing git repository...")
             output, exit_code = self.kodo_runner.execute_command(
@@ -165,13 +183,19 @@ class SWEBenchRunner:
                 additional_instructions="\n- Focus on the specific issue described\n- Make minimal changes to fix the issue\n- Ensure your changes don't break existing functionality"
             )
             
+            # Create profiler if enabled
+            profiler = None
+            if self.enable_profiling:
+                profiler = RolloutProfiler(enabled=True)
+            
             # Create agent
             agent = GeneralAgent(
                 max_rounds=30,  # More rounds for complex issues
                 debug=False,
                 termination_tool_names=["r2e_submit"],
                 action_parser=parse_xml_action_custom,
-                system_prompt=custom_system_prompt
+                system_prompt=custom_system_prompt,
+                profiler=profiler  # Pass profiler if enabled
             )
             agent.set_tools(tools)
             
@@ -201,6 +225,36 @@ First explore the repository structure, understand the codebase, locate the rele
             
             logger.info(f"Agent completed: {result.is_completed}")
             logger.info(f"Total steps: {len(result.steps)}")
+            
+            # Save trajectory
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            trajectory_dir = os.path.join(self.output_dir, "trajectories")
+            os.makedirs(trajectory_dir, exist_ok=True)
+            
+            # Use instance_id with timestamp for filename
+            safe_instance_id = instance_id.replace('/', '_').replace('__', '-')
+            trajectory_file = os.path.join(trajectory_dir, f"{safe_instance_id}_{timestamp}.jsonl")
+            dump_trajectory(result, trajectory_file, format="jsonl")
+            logger.info(f"Saved trajectory to: {trajectory_file}")
+            
+            # Save profiler data if enabled
+            if profiler and profiler.enabled:
+                profiler_dir = os.path.join(self.output_dir, "profiles")
+                os.makedirs(profiler_dir, exist_ok=True)
+                
+                # Save profiler data
+                profiler_file = os.path.join(profiler_dir, f"{safe_instance_id}_{timestamp}_profile.json")
+                profiler.export_events(profiler_file)
+                logger.info(f"Saved profiler data to: {profiler_file}")
+                
+                # Generate timeline visualization
+                timeline_file = os.path.join(profiler_dir, f"{safe_instance_id}_{timestamp}_timeline.html")
+                visualizer = ProfilerVisualizer({
+                    "summary": profiler.get_summary(),
+                    "events": [event.to_dict() for event in profiler.events]
+                })
+                visualizer.generate_html_timeline(timeline_file, title=f"Timeline: {instance_id}")
+                logger.info(f"Generated timeline visualization: {timeline_file}")
             
             # 5. Get the patch using git diff
             logger.info("Generating patch...")
@@ -236,26 +290,25 @@ First explore the repository structure, understand the codebase, locate the rele
             # Clean up pod
             if pod and self.kodo_runner:
                 try:
-                    logger.info(f"Cleaning up pod: {pod_name}")
-                    # For kodo, cleanup is handled by the runner
-                    # The pod variable is just the pod name when using kubernetes backend
-                    pass
+                    logger.info(f"Stopping container/pod: {pod_name}")
+                    # Stop the container to end this rollout
+                    self.kodo_runner.stop_container(pod)
+                    logger.info(f"Container/pod {pod_name} stopped successfully")
                 except Exception as e:
-                    logger.error(f"Error cleaning up pod: {e}")
+                    logger.error(f"Error stopping container/pod: {e}")
     
-    async def process_jsonl_file(self, jsonl_path: str, output_dir: str = "./swe_patches"):
+    async def process_jsonl_file(self, jsonl_path: str):
         """Process all instances in a JSONL file.
         
         Args:
             jsonl_path: Path to the JSONL file
-            output_dir: Directory to save patches
         """
         if not os.path.exists(jsonl_path):
             logger.error(f"JSONL file not found: {jsonl_path}")
             return
             
         # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
         
         # Read instances
         instances = []
@@ -269,38 +322,60 @@ First explore the repository structure, understand the codebase, locate the rele
                         logger.error(f"Error parsing line: {e}")
         
         logger.info(f"Loaded {len(instances)} instances from {jsonl_path}")
+        logger.info(f"Processing with max concurrency: {self.max_concurrent}")
         
-        # Process each instance
+        # Create tasks for all instances
+        tasks = []
         for i, instance in enumerate(instances):
-            logger.info(f"\nProcessing instance {i+1}/{len(instances)}")
-            
-            patch = await self.process_instance(instance)
-            
-            if patch:
+            task = asyncio.create_task(self._process_with_logging(instance, i+1, len(instances)))
+            tasks.append(task)
+        
+        # Wait for all tasks to complete
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        for i, (instance, result) in enumerate(zip(instances, results)):
+            if isinstance(result, Exception):
+                logger.error(f"Exception processing instance {i+1}: {result}")
+            elif result:
                 instance_id = instance.get("instance_id", f"unknown_{i}")
-                self.patches[instance_id] = patch
+                self.patches[instance_id] = result
                 
                 # Save patch to file
-                patch_file = os.path.join(output_dir, f"{instance_id.replace('/', '_')}.patch")
+                patch_file = os.path.join(self.output_dir, f"{instance_id.replace('/', '_')}.patch")
                 with open(patch_file, 'w') as f:
-                    f.write(patch)
+                    f.write(result)
                 logger.info(f"Saved patch to: {patch_file}")
-            
-            # Add delay between instances to avoid overwhelming the system
-            if i < len(instances) - 1:
-                await asyncio.sleep(5)
         
         # Save summary
-        summary_file = os.path.join(output_dir, "summary.json")
+        summary_file = os.path.join(self.output_dir, "summary.json")
         summary = {
             "total_instances": len(instances),
             "successful_patches": len(self.patches),
             "instance_ids": list(self.patches.keys()),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "trajectory_dir": os.path.join(self.output_dir, "trajectories"),
+            "max_concurrent": self.max_concurrent
         }
         with open(summary_file, 'w') as f:
             json.dump(summary, f, indent=2)
         logger.info(f"Saved summary to: {summary_file}")
+    
+    async def _process_with_logging(self, instance: Dict[str, Any], index: int, total: int) -> Optional[str]:
+        """Process an instance with logging."""
+        instance_id = instance.get("instance_id", f"unknown_{index}")
+        logger.info(f"\n[{index}/{total}] Starting processing of instance: {instance_id}")
+        
+        try:
+            patch = await self.process_instance(instance)
+            if patch:
+                logger.info(f"[{index}/{total}] Successfully processed instance: {instance_id}")
+            else:
+                logger.warning(f"[{index}/{total}] No patch generated for instance: {instance_id}")
+            return patch
+        except Exception as e:
+            logger.error(f"[{index}/{total}] Error processing instance {instance_id}: {e}")
+            raise
         
         # Cleanup kodo runner
         if self.kodo_runner:
@@ -325,6 +400,10 @@ async def main():
                        help="Kubernetes namespace (default: from K8S_NAMESPACE env or 'default')")
     parser.add_argument("--kubeconfig", default=os.getenv("KUBECONFIG", None),
                        help="Path to kubeconfig file (default: from KUBECONFIG env)")
+    parser.add_argument("--max-concurrent", type=int, default=1,
+                       help="Maximum number of concurrent instances to process (default: 1)")
+    parser.add_argument("--enable-profiling", action="store_true",
+                       help="Enable performance profiling for each instance")
     
     args = parser.parse_args()
     
@@ -332,15 +411,20 @@ async def main():
     logger.info(f"JSONL file: {args.jsonl_file}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Namespace: {args.namespace}")
+    logger.info(f"Max concurrent: {args.max_concurrent}")
+    logger.info(f"Profiling enabled: {args.enable_profiling}")
     
-    # Create runner
+    # Create runner with output directory and concurrency
     runner = SWEBenchRunner(
         namespace=args.namespace,
-        kubeconfig_path=args.kubeconfig
+        kubeconfig_path=args.kubeconfig,
+        output_dir=args.output_dir,
+        max_concurrent=args.max_concurrent,
+        enable_profiling=args.enable_profiling
     )
     
     # Process JSONL file
-    await runner.process_jsonl_file(args.jsonl_file, args.output_dir)
+    await runner.process_jsonl_file(args.jsonl_file)
     
     # Print summary
     patches = runner.get_patches()
@@ -357,6 +441,8 @@ if __name__ == "__main__":
         print("Usage: python test_r2e_general_agent_on_swe.py <jsonl_file> [options]")
         print("\nExample:")
         print("  python test_r2e_general_agent_on_swe.py swe_bench_verified.jsonl --output-dir ./patches")
+        print("\nConcurrent processing example:")
+        print("  python test_r2e_general_agent_on_swe.py swe_bench_verified.jsonl --max-concurrent 10")
         print("\nFor testing with a sample JSONL:")
         print('  echo \'{"instance_id": "test-001", "issue": "Fix import error", "image": "ubuntu:20.04"}\' > test.jsonl')
         print("  python test_r2e_general_agent_on_swe.py test.jsonl")

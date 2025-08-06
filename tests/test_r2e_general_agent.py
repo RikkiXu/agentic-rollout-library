@@ -210,6 +210,60 @@ class CustomDescriptionWrapper:
         return getattr(self.tool, name)
 
 
+def generate_custom_system_prompt(tools, **kwargs):
+    """Generate custom system prompt with dynamic variables.
+    
+    Args:
+        tools: Dictionary of tool instances
+        **kwargs: Additional variables to inject into the prompt
+            - task_description: Description of the task
+            - working_directory: Current working directory
+            - additional_instructions: Any additional instructions
+    """
+    task_description = kwargs.get('task_description', 'solve certain tasks (e.g., file localization, testcase generation, code repair and editing etc) to resolve the issue')
+    working_directory = kwargs.get('working_directory', '/testbed')
+    additional_instructions = kwargs.get('additional_instructions', '')
+    
+    prompt = f"""You are a programming agent who is provided a github issue and repository bash environment and is tasked to {task_description}.
+
+Current working directory: {working_directory}
+
+We have access to the following functions:
+
+{tools['r2e_file_editor'].get_description()}
+
+{tools['r2e_bash_executor'].get_description()}
+
+{tools['r2e_search'].get_description()}
+
+{tools['r2e_submit'].get_description()}
+
+When calling a function, your response should follow this format:
+
+First, explain your reasoning and what you plan to do (as natural text).
+
+Then, make the function call in this exact format:
+<function=example_function_name>
+<parameter=example_parameter_1>value_1</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+
+<IMPORTANT>
+Reminder:
+- ALWAYS start with your reasoning/thought process before the function call
+- Function calls MUST follow the specified XML format
+- Required parameters MUST be specified
+- Only call one function at a time
+- Your complete response = reasoning (natural text) + function call (XML format)
+{additional_instructions}"""
+    
+    return prompt
+
+
 async def test_r2e_general_agent_k8s(output_dir: str = "./trajectories"):
     """Test GeneralAgent with R2E tools in K8S execution mode.
     
@@ -269,61 +323,6 @@ async def test_r2e_general_agent_k8s(output_dir: str = "./trajectories"):
     
     # Create GeneralAgent with R2E tools
     print("\n🤖 Creating GeneralAgent with R2E tools...")
-
-
-    # Function to generate custom system prompt with variables
-    def generate_custom_system_prompt(tools, **kwargs):
-        """Generate custom system prompt with dynamic variables.
-        
-        Args:
-            tools: Dictionary of tool instances
-            **kwargs: Additional variables to inject into the prompt
-                - task_description: Description of the task
-                - working_directory: Current working directory
-                - additional_instructions: Any additional instructions
-        """
-        task_description = kwargs.get('task_description', 'solve certain tasks (e.g., file localization, testcase generation, code repair and editing etc) to resolve the issue')
-        working_directory = kwargs.get('working_directory', '/testbed')
-        additional_instructions = kwargs.get('additional_instructions', '')
-        
-        prompt = f"""You are a programming agent who is provided a github issue and repository bash environment and is tasked to {task_description}.
-
-Current working directory: {working_directory}
-
-We have access to the following functions:
-
-{tools['r2e_file_editor'].get_description()}
-
-{tools['r2e_bash_executor'].get_description()}
-
-{tools['r2e_search'].get_description()}
-
-{tools['r2e_submit'].get_description()}
-
-When calling a function, your response should follow this format:
-
-First, explain your reasoning and what you plan to do (as natural text).
-
-Then, make the function call in this exact format:
-<function=example_function_name>
-<parameter=example_parameter_1>value_1</parameter>
-<parameter=example_parameter_2>
-This is the value for the second parameter
-that can span
-multiple lines
-</parameter>
-</function>
-
-<IMPORTANT>
-Reminder:
-- ALWAYS start with your reasoning/thought process before the function call
-- Function calls MUST follow the specified XML format
-- Required parameters MUST be specified
-- Only call one function at a time
-- Your complete response = reasoning (natural text) + function call (XML format)
-{additional_instructions}"""
-        
-        return prompt
     
     # Generate custom system prompt with variables
     custom_system_prompt = generate_custom_system_prompt(
