@@ -19,8 +19,8 @@ async def test_basic_functionality():
     print("=== 测试LLMAPIClient基本功能 ===")
     
     # API配置
-    api_key = "sk-qq7xJtnAdB1Gv6IkHTQhDAPuUAT700vF3CMmGinILsmP2HuY"
-    base_url = "http://211.23.3.237:27544"
+    api_key = "**************************************"
+    base_url = "**********************"
     model = "claude-sonnet-4-20250514"
     
     # 1. 使用工厂函数创建客户端
