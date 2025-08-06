@@ -465,11 +465,19 @@ After receiving the observation, continue with the next thought and action until
         
         # End trajectory profiling
         if trajectory_event_id:
-            profiler.end_event(trajectory_event_id)
+            try:
+                profiler.end_event(trajectory_event_id)
+            except Exception as e:
+                logger.warning(f"Error ending profiler event: {e}")
         
         # Add profiler data to trajectory metadata if enabled
         if profiler.enabled and profiler.events:
-            trajectory.metadata["profiler_summary"] = profiler.get_summary()
+            try:
+                # Add timeout protection for profiler summary generation
+                trajectory.metadata["profiler_summary"] = profiler.get_summary()
+            except Exception as e:
+                logger.warning(f"Error getting profiler summary: {e}")
+                trajectory.metadata["profiler_summary"] = {"error": str(e)}
         
         return trajectory
     

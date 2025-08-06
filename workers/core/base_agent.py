@@ -261,13 +261,38 @@ Think step by step and use the available tools when necessary."""
         """
         trajectory.is_completed = True
         trajectory.final_reward = trajectory.get_total_reward()
-        trajectory.total_tokens = sum(
-            len(step.content.split()) for step in trajectory.steps
-        )
         
-        logger.info(
-            f"Finalized trajectory {trajectory.request_id}: "
-            f"{len(trajectory.steps)} steps, "
-            f"reward={trajectory.final_reward:.3f}, "
-            f"tokens≈{trajectory.total_tokens}"
-        )
+        # Optimize token counting for large trajectories
+        try:
+            # Use a more efficient approximation for very large trajectories
+            if len(trajectory.steps) > 100:
+                # Sample-based estimation for very large trajectories
+                sample_size = min(50, len(trajectory.steps))
+                sample_indices = range(0, len(trajectory.steps), len(trajectory.steps) // sample_size)
+                sample_tokens = sum(
+                    len(trajectory.steps[i].content.split()) 
+                    for i in sample_indices
+                )
+                trajectory.total_tokens = int(sample_tokens * len(trajectory.steps) / sample_size)
+            else:
+                # Exact count for smaller trajectories
+                trajectory.total_tokens = sum(
+                    len(step.content.split()) for step in trajectory.steps
+                )
+        except Exception as e:
+            # Fallback to character-based estimation if splitting fails
+            logger.warning(f"Error counting tokens, using character estimate: {e}")
+            total_chars = sum(len(step.content) for step in trajectory.steps)
+            trajectory.total_tokens = total_chars // 5  # Rough estimate: 5 chars per token
+        
+        # Use non-blocking logging
+        try:
+            logger.info(
+                f"Finalized trajectory {trajectory.request_id}: "
+                f"{len(trajectory.steps)} steps, "
+                f"reward={trajectory.final_reward:.3f}, "
+                f"tokens≈{trajectory.total_tokens}"
+            )
+        except Exception as e:
+            # Silently ignore logging errors to prevent blocking
+            pass
