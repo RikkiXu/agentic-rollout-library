@@ -624,6 +624,43 @@ process_single_instance('{instance_data_file}', '{output_file}', '{model_name}')
                 'instance_id': instance_id,
                 'error': 'No output file generated'
             }
+    
+    async def _run_local_instance(self, index: int, total: int, instance_data_file: str,
+                                 output_file: str, model_name: str) -> Optional[Dict]:
+        """Run a single instance locally (without subprocess) for debugging."""
+        # Load instance data to get instance_id
+        with open(instance_data_file, 'rb') as f:
+            data = pickle.load(f)
+        instance_id = data['instance'].get('instance_id', f'instance_{index}')
+        
+        logger.info(f"[{index+1}/{total}] Starting local execution for {instance_id} with model {model_name}")
+        
+        try:
+            # Run the instance processing directly
+            process_single_instance(instance_data_file, output_file, model_name, None)
+            
+            # Read result
+            if os.path.exists(output_file):
+                with open(output_file, 'r') as f:
+                    result = json.load(f)
+                logger.info(f"[{index+1}/{total}] Local execution completed for {instance_id}: {result.get('success', False)}")
+                return result
+            else:
+                logger.error(f"[{index+1}/{total}] No output file generated for {instance_id}")
+                return {
+                    'success': False,
+                    'instance_id': instance_id,
+                    'error': 'No output file generated'
+                }
+        except Exception as e:
+            logger.error(f"[{index+1}/{total}] Local execution failed for {instance_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'success': False,
+                'instance_id': instance_id,
+                'error': str(e)
+            }
 
 
 async def main():
