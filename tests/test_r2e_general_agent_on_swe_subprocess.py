@@ -34,7 +34,7 @@ BASE_URL = os.getenv("LLM_BASE_URL", "your-base-url-here")
 MODEL_NAME = os.getenv("LLM_MODEL_NAME", "claude-3-sonnet")
 
 
-def process_single_instance(instance_data_file: str, output_file: str, model_name: str = None) -> None:
+def process_single_instance(instance_data_file: str, output_file: str, model_name: str = None, log_file: str = None) -> None:
     """
     Process a single instance in a subprocess.
     This function will be called by subprocess.run().
@@ -43,6 +43,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
         instance_data_file: Path to pickled instance data
         output_file: Path to save the patch result
         model_name: Model name to use (with index if load balancing)
+        log_file: Path to save the subprocess logs
     """
     import sys
     import os
@@ -78,8 +79,26 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
         generate_custom_system_prompt
     )
     
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(process)d] - %(levelname)s - %(message)s')
+    # Configure logging
+    handlers = []
+    log_format = '%(asctime)s - [%(process)d] - %(levelname)s - %(message)s'
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(log_format))
+    handlers.append(console_handler)
+    
+    # File handler if log_file is provided
+    if log_file:
+        file_handler = logging.FileHandler(log_file, mode='w')
+        file_handler.setFormatter(logging.Formatter(log_format))
+        handlers.append(file_handler)
+    
+    logging.basicConfig(level=logging.INFO, handlers=handlers, force=True)
     logger = logging.getLogger(__name__)
+    
+    if log_file:
+        logger.info(f"Logging to file: {log_file}")
     
     # Load instance data
     with open(instance_data_file, 'rb') as f:
@@ -90,6 +109,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
     kubeconfig_path = data['kubeconfig_path']
     output_dir = data['output_dir']
     enable_profiling = data['enable_profiling']
+    max_tokens = data.get('max_tokens', 16000)  # Get max_tokens from data
     
     instance_id = instance.get("instance_id", "unknown")
     issue = instance.get("problem_statement", "")
@@ -228,6 +248,12 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
                 model=actual_model_name,
                 debug=True
             )
+            
+            # Override the generate method to use custom max_tokens
+            original_generate = llm_client.generate
+            async def generate_with_custom_tokens(messages, max_tokens_param=None, **kwargs):
+                return await original_generate(messages, max_tokens=max_tokens, **kwargs)
+            llm_client.generate = generate_with_custom_tokens
             
             prompt = f"""
 Consider the following github issue:
