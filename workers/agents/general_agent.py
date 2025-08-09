@@ -344,7 +344,11 @@ After receiving the observation, continue with the next thought and action until
                     {
                         "round": round_count + 1,
                         "model": trajectory.metadata.get("model", "unknown"),
-                        "expected_step_type": expected_step_type.value if expected_step_type else None
+                        "expected_step_type": expected_step_type.value if expected_step_type else None,
+                        "max_tokens": self.max_tokens_per_step,
+                        "temperature": self.temperature,
+                        "message_count": len(messages),
+                        "total_message_chars": sum(len(m.get("content", "")) for m in messages)
                     }
                 ):
                     response = await llm_generate_func(
@@ -462,23 +466,29 @@ After receiving the observation, continue with the next thought and action until
             trajectory.metadata["average_assistant_response_time_seconds"] = round(avg_time, 3)
         
         self.finalize_trajectory(trajectory)
+        logger.info(f"[DEBUG] finalize_trajectory completed for {trajectory.request_id}")
         
         # End trajectory profiling
         if trajectory_event_id:
+            logger.info(f"[DEBUG] Ending profiler event for {trajectory.request_id}")
             try:
                 profiler.end_event(trajectory_event_id)
+                logger.info(f"[DEBUG] Profiler event ended for {trajectory.request_id}")
             except Exception as e:
                 logger.warning(f"Error ending profiler event: {e}")
         
         # Add profiler data to trajectory metadata if enabled
         if profiler.enabled and profiler.events:
+            logger.info(f"[DEBUG] Getting profiler summary for {trajectory.request_id}")
             try:
                 # Add timeout protection for profiler summary generation
                 trajectory.metadata["profiler_summary"] = profiler.get_summary()
+                logger.info(f"[DEBUG] Profiler summary added for {trajectory.request_id}")
             except Exception as e:
                 logger.warning(f"Error getting profiler summary: {e}")
                 trajectory.metadata["profiler_summary"] = {"error": str(e)}
         
+        logger.info(f"[DEBUG] About to return trajectory for {trajectory.request_id}")
         return trajectory
     
     def _extract_prompt_content(self, prompt: Union[str, Dict[str, Any]]) -> str:
@@ -1084,19 +1094,33 @@ def dump_trajectory(trajectory: Trajectory, filepath: str, format: str = "json")
     """
     try:
         if format.lower() == "jsonl":
+            logger.debug(f"[DUMP] Starting JSONL dump to {filepath}")
             # Save as JSONL format - one message per line
             with open(filepath, 'w', encoding='utf-8') as f:
                 # First, add metadata as a special message
                 if trajectory.metadata:
-                    meta_msg = {
-                        "role": "meta",
-                        "content": json.dumps(trajectory.metadata, ensure_ascii=False),
-                        "meta": trajectory.metadata  # Also include as structured data
-                    }
-                    f.write(json.dumps(meta_msg, ensure_ascii=False) + '\n')
+                    logger.debug(f"[DUMP] Writing metadata...")
+                    try:
+                        # Create a copy of metadata to avoid modifying original
+                        metadata_copy = trajectory.metadata.copy()
+                        # Remove potentially problematic fields
+                        if 'profiler_summary' in metadata_copy:
+                            del metadata_copy['profiler_summary']
+                        
+                        meta_msg = {
+                            "role": "meta",
+                            "content": json.dumps(metadata_copy, ensure_ascii=False),
+                            "meta": metadata_copy  # Also include as structured data
+                        }
+                        f.write(json.dumps(meta_msg, ensure_ascii=False) + '\n')
+                        logger.debug(f"[DUMP] Metadata written successfully")
+                    except Exception as e:
+                        logger.error(f"[DUMP] Failed to write metadata: {e}")
+                        # Continue without metadata
                 
                 # Then, add system prompt if available
                 if hasattr(trajectory, 'system_prompt') and trajectory.system_prompt:
+                    logger.debug(f"[DUMP] Writing system prompt...")
                     system_msg = {
                         "role": "system",
                         "content": trajectory.system_prompt
@@ -1104,9 +1128,14 @@ def dump_trajectory(trajectory: Trajectory, filepath: str, format: str = "json")
                     f.write(json.dumps(system_msg, ensure_ascii=False) + '\n')
                 
                 # Then add all trajectory messages
+                logger.debug(f"[DUMP] Getting messages from trajectory...")
                 messages = trajectory.get_messages()
-                for msg in messages:
+                logger.debug(f"[DUMP] Got {len(messages)} messages, writing them...")
+                for i, msg in enumerate(messages):
+                    if i % 10 == 0:
+                        logger.debug(f"[DUMP] Writing message {i+1}/{len(messages)}...")
                     f.write(json.dumps(msg, ensure_ascii=False) + '\n')
+                logger.debug(f"[DUMP] All messages written successfully")
         
         elif format.lower() == "json":
             # Convert trajectory to JSON-serializable format

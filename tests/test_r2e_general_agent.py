@@ -97,7 +97,7 @@ Behavior notes:
   •    If the command times out, it will be interrupted (SIGINT). The assistant may then retry or do further steps if needed.
 
 Parameters:
-  1.    command (string, required)
+  1.    cmd (string, required)
 The bash command (and optional arguments) to execute.
   •    Can be empty ("") to retrieve more logs if the process is still running.
   •    Can be "ctrl+c" to interrupt the running process.
@@ -126,10 +126,12 @@ Finish the interaction once the task is complete or if no further progress can b
 
 Behavior notes:
   •    The submit command finalizes your output.
-  •    This function takes no parameters.
 
 Parameters:
-  None - This function requires no parameters.
+  1.    command (string, required)
+Currently allowed value: [submit]
+  2.    result (string, optional)
+The result text or final message to submit. Defaults to an empty string if not provided.
 
 –– END FUNCTION #4 ––"""
 }
@@ -226,8 +228,6 @@ def generate_custom_system_prompt(tools, **kwargs):
     
     prompt = f"""You are a programming agent who is provided a github issue and repository bash environment and is tasked to {task_description}.
 
-Current working directory: {working_directory}
-
 We have access to the following functions:
 
 {tools['r2e_file_editor'].get_description()}
@@ -238,11 +238,8 @@ We have access to the following functions:
 
 {tools['r2e_submit'].get_description()}
 
-When calling a function, your response should follow this format:
+If you choose to call a function ONLY reply in the following format with NO suffix:
 
-First, explain your reasoning and what you plan to do (as natural text).
-
-Then, make the function call in this exact format:
 <function=example_function_name>
 <parameter=example_parameter_1>value_1</parameter>
 <parameter=example_parameter_2>
@@ -254,11 +251,10 @@ multiple lines
 
 <IMPORTANT>
 Reminder:
-- ALWAYS start with your reasoning/thought process before the function call
-- Function calls MUST follow the specified XML format
+- Function calls MUST follow the specified format, start with <function= and end with </function>
 - Required parameters MUST be specified
 - Only call one function at a time
-- Your complete response = reasoning (natural text) + function call (XML format)
+- VERY IMPORTANT: Each response must include both reasoning (as natural text) and function call (in above format) to solve the task.
 {additional_instructions}"""
     
     return prompt

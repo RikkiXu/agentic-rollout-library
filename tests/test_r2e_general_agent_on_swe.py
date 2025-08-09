@@ -26,7 +26,8 @@ from workers.agents.general_agent import GeneralAgent, dump_trajectory
 from workers.core import create_tool
 from workers.utils import create_llm_client
 from workers.core.trajectory import TrajectoryStep, StepType
-from workers.core.profiler import RolloutProfiler
+from workers.core.profiler import RolloutProfiler, EventType
+from workers.core.safe_profiler import SafeProfiler
 from workers.core.profiler_visualizer import ProfilerVisualizer
 import logging
 import re
@@ -53,6 +54,33 @@ from test_r2e_general_agent import (
     CustomDescriptionWrapper,
     generate_custom_system_prompt
 )
+
+
+def get_event_type_safe(event_type_name: str) -> Optional['EventType']:
+    """Safely get an EventType, falling back to CUSTOM if not available.
+    
+    Args:
+        event_type_name: Name of the EventType attribute (e.g., 'INSTANCE_PROCESSING')
+        
+    Returns:
+        The EventType if available, otherwise EventType.CUSTOM or None if that's also not available
+    """
+    try:
+        return getattr(EventType, event_type_name)
+    except AttributeError:
+        logger.warning(f"EventType.{event_type_name} not available, trying CUSTOM")
+        try:
+            return EventType.CUSTOM
+        except AttributeError:
+            logger.error(f"EventType.CUSTOM also not available, profiling may not work correctly")
+            # Return the first available EventType
+            for attr in dir(EventType):
+                if not attr.startswith('_'):
+                    try:
+                        return getattr(EventType, attr)
+                    except:
+                        continue
+            return None
 
 
 class SWEBenchRunner:
@@ -104,6 +132,7 @@ class SWEBenchRunner:
         instance_id = instance.get("instance_id", "unknown")
         issue = instance.get("problem_statement", "")
         image = instance.get("image", "")
+        base_commit = instance.get("base_commit", "")
         
         if not all([instance_id, issue, image]):
             logger.error(f"Missing required fields for instance {instance_id}")
@@ -115,6 +144,31 @@ class SWEBenchRunner:
         logger.info(f"Issue: {issue[:100]}..." if len(issue) > 100 else f"Issue: {issue}")
         logger.info(f"{'='*80}")
         
+        # Create overall instance profiler if enabled
+        instance_profiler = None
+        instance_event_id = None
+        if self.enable_profiling:
+            try:
+                # Use SafeProfiler to avoid potential deadlocks with external libraries
+                instance_profiler = SafeProfiler(enabled=True)
+                event_type = get_event_type_safe('INSTANCE_PROCESSING')
+                if event_type:
+                    instance_event_id = instance_profiler.start_event(
+                        f"instance_{instance_id}",
+                        event_type,
+                        {"instance_id": instance_id, "image": image}
+                    )
+                    logger.debug(f"Started profiling instance with event_id: {instance_event_id}")
+                else:
+                    logger.warning("Could not get any EventType, profiling disabled for this instance")
+                    instance_profiler = None
+            except Exception as e:
+                logger.error(f"Failed to create profiler for {instance_id}: {e}")
+                import traceback
+                logger.error(f"Profiler creation traceback:\n{traceback.format_exc()}")
+                # Continue without profiling
+                instance_profiler = None
+        
         # Initialize kodo if needed
         self._init_kodo()
         
@@ -125,9 +179,37 @@ class SWEBenchRunner:
         try:
             # 1. Start pod using kodo
             logger.info(f"Starting pod: {pod_name}")
+            
+            # Profile pod creation if profiler is available
+            pod_creation_event_id = None
+            if instance_profiler and instance_profiler.enabled:
+                try:
+                    event_type = get_event_type_safe('POD_CREATION')
+                    if event_type:
+                        pod_creation_event_id = instance_profiler.start_event(
+                            f"pod_creation_{instance_id}",
+                            event_type,
+                            {"instance_id": instance_id, "pod_name": pod_name, "image": image}
+                        )
+                        logger.debug(f"Started profiling pod creation with event_id: {pod_creation_event_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to start pod creation profiling: {e}")
+                    # Continue without profiling this event
+            
+            # End pod creation profiling BEFORE calling kodo_runner to avoid potential deadlock
+            if instance_profiler and instance_profiler.enabled and pod_creation_event_id:
+                try:
+                    instance_profiler.end_event(pod_creation_event_id)
+                    logger.debug(f"Ended profiling pod creation BEFORE kodo call with event_id: {pod_creation_event_id}")
+                    pod_creation_event_id = None  # Clear to avoid double-ending
+                except Exception as e:
+                    logger.warning(f"Failed to end pod creation profiling: {e}")
+            
+            logger.info(f"Calling kodo_runner.start_container for pod: {pod_name}")
             pod = self.kodo_runner.start_container(
                 image=image,
                 name=pod_name,
+                node_selector={"nvme": "ok"},
                 environment={
                     "PYTHONPATH": "/testbed",
                     "SWE_INSTANCE_ID": instance_id,
@@ -137,19 +219,20 @@ class SWEBenchRunner:
                     "PIP_TRUSTED_HOST": "pip.baidu.com"
                 }
             )
+            
             logger.info(f"Pod {pod_name} started successfully")
             
             # Wait for pod to be ready
             await asyncio.sleep(5)
             output, exit_code = self.kodo_runner.execute_command(pod, f"ln -s /opt/miniconda3/envs/testbed /root/.venv")
             # 2. Initialize git repo to track changes
-            logger.info("Initializing git repository...")
-            output, exit_code = self.kodo_runner.execute_command(
-                pod, 
-                "cd /testbed && git init && git config user.email 'agent@swe.bench' && git config user.name 'SWE Agent' && git add -A && git commit -m 'Initial commit' || true"
-            )
-            if exit_code != 0:
-                logger.warning(f"Git init had issues: {output}")
+            #logger.info("Initializing git repository...")
+            #output, exit_code = self.kodo_runner.execute_command(
+            #    pod, 
+            #    "cd /testbed && git init && git config user.email 'agent@swe.bench' && git config user.name 'SWE Agent' && git add -A && git commit -m 'Initial commit' || true"
+            #)
+            #if exit_code != 0:
+            #    logger.warning(f"Git init had issues: {output}")
             
             # 3. Create agent with R2E tools configured for this pod
             k8s_config = {
@@ -183,10 +266,8 @@ class SWEBenchRunner:
                 additional_instructions="\n- Focus on the specific issue described\n- Make minimal changes to fix the issue\n- Ensure your changes don't break existing functionality"
             )
             
-            # Create profiler if enabled
-            profiler = None
-            if self.enable_profiling:
-                profiler = RolloutProfiler(enabled=True)
+            # Use the instance profiler for the agent
+            profiler = instance_profiler
             
             # Create agent
             agent = GeneralAgent(
@@ -223,6 +304,7 @@ First explore the repository structure, understand the codebase, locate the rele
                 request_id=f"swe_{instance_id}"
             )
             
+            logger.info(f"[DEBUG] run_trajectory completed for {instance_id}")
             logger.info(f"Agent completed: {result.is_completed}")
             logger.info(f"Total steps: {len(result.steps)}")
             
@@ -234,44 +316,68 @@ First explore the repository structure, understand the codebase, locate the rele
             # Use instance_id with timestamp for filename
             safe_instance_id = instance_id.replace('/', '_').replace('__', '-')
             trajectory_file = os.path.join(trajectory_dir, f"{safe_instance_id}_{timestamp}.jsonl")
-            dump_trajectory(result, trajectory_file, format="jsonl")
-            logger.info(f"Saved trajectory to: {trajectory_file}")
+            
+            logger.info(f"[DEBUG] Starting dump_trajectory for {instance_id}")
+            try:
+                dump_trajectory(result, trajectory_file, format="jsonl")
+                logger.info(f"[DEBUG] dump_trajectory completed for {instance_id}")
+                logger.info(f"Saved trajectory to: {trajectory_file}")
+            except Exception as e:
+                logger.error(f"[DEBUG] dump_trajectory failed for {instance_id}: {e}")
+                import traceback
+                traceback.print_exc()
             
             # Save profiler data if enabled
-            if profiler and profiler.enabled:
+            if instance_profiler and instance_profiler.enabled:
                 profiler_dir = os.path.join(self.output_dir, "profiles")
                 os.makedirs(profiler_dir, exist_ok=True)
                 
                 # Save profiler data
                 profiler_file = os.path.join(profiler_dir, f"{safe_instance_id}_{timestamp}_profile.json")
-                profiler.export_events(profiler_file)
+                instance_profiler.export_events(profiler_file)
                 logger.info(f"Saved profiler data to: {profiler_file}")
                 
                 # Generate timeline visualization
                 timeline_file = os.path.join(profiler_dir, f"{safe_instance_id}_{timestamp}_timeline.html")
                 visualizer = ProfilerVisualizer({
-                    "summary": profiler.get_summary(),
-                    "events": [event.to_dict() for event in profiler.events]
+                    "summary": instance_profiler.get_summary(),
+                    "events": [event.to_dict() for event in instance_profiler.events]
                 })
                 visualizer.generate_html_timeline(timeline_file, title=f"Timeline: {instance_id}")
                 logger.info(f"Generated timeline visualization: {timeline_file}")
             
             # 5. Get the patch using git diff
-            logger.info("Generating patch...")
+            logger.info(f"[DEBUG] Starting patch generation for {instance_id}")
             
             # First add all changes
-            output, exit_code = self.kodo_runner.execute_command(
-                pod,
-                "cd /testbed && git add -A"
-            )
+            logger.info(f"[DEBUG] Running git add -A for {instance_id}")
+            try:
+                output, exit_code = self.kodo_runner.execute_command(
+                    pod,
+                    "cd /testbed && git add -A"
+                )
+                logger.info(f"[DEBUG] git add completed with exit code: {exit_code}")
+            except Exception as e:
+                logger.error(f"[DEBUG] git add failed: {e}")
+                return None
             
             # Get the diff
-            output, exit_code = self.kodo_runner.execute_command(
-                pod,
-                "cd /testbed && git diff --cached"
-            )
-            
-            if exit_code == 0 and output.strip():
+            logger.info(f"[DEBUG] Running git diff {base_commit} for {instance_id}")
+            try:
+                output, exit_code = self.kodo_runner.execute_command(
+                    pod,
+                    f"git add -A && git diff {base_commit} > /testbed/{base_commit}_diff.patch && cat /testbed/{base_commit}_diff.patch"
+                )
+                logger.info(f"[DEBUG] git diff completed with exit code: {exit_code}, output length: {len(output) if output else 0}")
+            except Exception as e:
+                logger.error(f"[DEBUG] git diff failed: {e}")
+                return None
+
+            logger.info("begin to generate patch file")
+            logger.info(exit_code)
+            logger.info(output.strip())
+            logger.info("ok")
+            if int(exit_code) == 0:
                 patch = output.strip()
                 logger.info(f"Generated patch ({len(patch)} chars)")
                 logger.debug(f"Patch preview: {patch[:500]}..." if len(patch) > 500 else f"Patch: {patch}")
@@ -311,11 +417,40 @@ First explore the repository structure, understand the codebase, locate the rele
             if pod and self.kodo_runner:
                 try:
                     logger.info(f"Stopping container/pod: {pod_name}")
+                    
+                    # Profile pod deletion if profiler is available
+                    pod_deletion_event_id = None
+                    if instance_profiler and instance_profiler.enabled:
+                        try:
+                            event_type = get_event_type_safe('POD_DELETION')
+                            if event_type:
+                                pod_deletion_event_id = instance_profiler.start_event(
+                                    f"pod_deletion_{instance_id}",
+                                    event_type,
+                                    {"instance_id": instance_id, "pod_name": pod_name}
+                                )
+                                logger.debug(f"Started profiling pod deletion with event_id: {pod_deletion_event_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to start pod deletion profiling: {e}")
+                    
                     # Stop the container to end this rollout
                     self.kodo_runner.stop_container(pod)
+                    
+                    # End pod deletion profiling
+                    if instance_profiler and instance_profiler.enabled and pod_deletion_event_id:
+                        try:
+                            instance_profiler.end_event(pod_deletion_event_id)
+                            logger.debug(f"Ended profiling pod deletion with event_id: {pod_deletion_event_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to end pod deletion profiling: {e}")
+                    
                     logger.info(f"Container/pod {pod_name} stopped successfully")
                 except Exception as e:
                     logger.error(f"Error stopping container/pod: {e}")
+            
+            # End overall instance processing profiling
+            if instance_profiler and instance_profiler.enabled and instance_event_id:
+                instance_profiler.end_event(instance_event_id)
     
     async def process_jsonl_file(self, jsonl_path: str):
         """Process all instances in a JSONL file.
@@ -395,6 +530,8 @@ First explore the repository structure, understand the codebase, locate the rele
             return patch
         except Exception as e:
             logger.error(f"[{index}/{total}] Error processing instance {instance_id}: {e}")
+            import traceback
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
             raise
         
         # Cleanup kodo runner
@@ -427,7 +564,7 @@ async def main():
     
     args = parser.parse_args()
     
-    logger.info("🚀 Starting SWE-bench R2E Agent Runner")
+    logger.info("ðŸš€ Starting SWE-bench R2E Agent Runner")
     logger.info(f"JSONL file: {args.jsonl_file}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Namespace: {args.namespace}")
@@ -449,7 +586,7 @@ async def main():
     # Print summary
     patches = runner.get_patches()
     logger.info(f"\n{'='*80}")
-    logger.info(f"✅ Processing complete!")
+    logger.info(f"âœ… Processing complete!")
     logger.info(f"Total patches generated: {len(patches)}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"{'='*80}")

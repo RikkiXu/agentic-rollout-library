@@ -31,6 +31,8 @@ class EventType(Enum):
     # K8s operations
     K8S_COMMAND = "k8s_command"
     POD_OPERATION = "pod_operation"
+    POD_CREATION = "pod_creation"
+    POD_DELETION = "pod_deletion"
     
     # Agent operations
     TRAJECTORY_STEP = "trajectory_step"
@@ -39,6 +41,9 @@ class EventType(Enum):
     # System operations
     NETWORK_IO = "network_io"
     DISK_IO = "disk_io"
+    
+    # Instance processing
+    INSTANCE_PROCESSING = "instance_processing"
     
     # Custom events
     CUSTOM = "custom"
@@ -55,10 +60,13 @@ EVENT_COLORS = {
     EventType.SEARCH_OPERATION: "#98D8C8", # Mint
     EventType.K8S_COMMAND: "#F7DC6F",      # Yellow
     EventType.POD_OPERATION: "#F8C471",    # Orange
+    EventType.POD_CREATION: "#FF8C00",     # Dark Orange
+    EventType.POD_DELETION: "#DC143C",     # Crimson
     EventType.TRAJECTORY_STEP: "#BB8FCE",  # Purple
     EventType.THOUGHT_GENERATION: "#85C1E2", # Sky Blue
     EventType.NETWORK_IO: "#F1948A",       # Salmon
     EventType.DISK_IO: "#82E0AA",          # Light Green
+    EventType.INSTANCE_PROCESSING: "#4169E1", # Royal Blue
     EventType.CUSTOM: "#D7BDE2",           # Lavender
 }
 
@@ -108,7 +116,7 @@ class RolloutProfiler:
         self.events: List[ProfileEvent] = []
         self.active_events: Dict[str, ProfileEvent] = {}
         self.start_time = time.time()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # Use RLock to allow re-entrant locking
     
     @contextmanager
     def profile(self, name: str, event_type: EventType, metadata: Optional[Dict[str, Any]] = None):
@@ -181,7 +189,8 @@ class RolloutProfiler:
         with self._lock:
             if event_id in self.active_events:
                 event = self.active_events.pop(event_id)
-                self._end_event(event)
+                event.complete()
+                self.events.append(event)
     
     def _start_event(self, name: str, event_type: EventType, metadata: Optional[Dict[str, Any]] = None) -> ProfileEvent:
         """Internal method to start an event."""

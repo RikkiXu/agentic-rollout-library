@@ -174,10 +174,19 @@ Think step by step and use the available tools when necessary."""
                 # Legacy tool interface
                 result = await tool.execute(**tool_args)
             
-            # Create result step
+            # Create result step with "Execution output of" prefix
+            # Map tool names to their display names for consistency with trajectory example
+            tool_display_names = {
+                "r2e_file_editor": "file_editor",
+                "r2e_bash_executor": "execute_bash",
+                "r2e_search": "search",
+                "r2e_submit": "finish"
+            }
+            display_name = tool_display_names.get(tool_name, tool_name)
+            
             result_step = TrajectoryStep(
                 step_type=StepType.ACTION_RESULT,
-                content=str(result),
+                content=f"Execution output of [{display_name}]:\n{str(result)}",
                 metadata={
                     "tool_name": tool_name,
                     "tool_args": tool_args,
@@ -193,9 +202,18 @@ Think step by step and use the available tools when necessary."""
             
         except Exception as e:
             logger.error(f"Tool execution failed: {e}")
+            # Map tool names to their display names for consistency
+            tool_display_names = {
+                "r2e_file_editor": "file_editor",
+                "r2e_bash_executor": "execute_bash",
+                "r2e_search": "search",
+                "r2e_submit": "finish"
+            }
+            display_name = tool_display_names.get(tool_name, tool_name)
+            
             error_step = TrajectoryStep(
                 step_type=StepType.ACTION_RESULT,
-                content=f"Error executing tool {tool_name}: {str(e)}",
+                content=f"Execution output of [{display_name}]:\nError: {str(e)}",
                 metadata={
                     "tool_name": tool_name,
                     "tool_args": tool_args,

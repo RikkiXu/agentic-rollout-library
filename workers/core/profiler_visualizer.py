@@ -480,7 +480,32 @@ class ProfilerVisualizer:
             if (event.metadata && Object.keys(event.metadata).length > 0) {{
                 content += `<div class="tooltip-item" style="margin-top: 5px;">Metadata:</div>`;
                 for (const [key, value] of Object.entries(event.metadata)) {{
-                    content += `<div class="tooltip-item" style="margin-left: 10px;">${{key}}: ${{value}}</div>`;
+                    let displayValue = value;
+                    // Handle different value types
+                    if (typeof value === 'object' && value !== null) {{
+                        // For objects and arrays, show formatted JSON
+                        try {{
+                            displayValue = JSON.stringify(value, null, 2);
+                            // If it's too long, truncate it
+                            if (displayValue.length > 200) {{
+                                displayValue = displayValue.substring(0, 200) + '...';
+                            }}
+                            // Escape HTML and preserve formatting
+                            displayValue = '<pre style="margin: 0; white-space: pre-wrap; word-wrap: break-word;">' + 
+                                         displayValue.replace(/</g, '&lt;').replace(/>/g, '&gt;') + 
+                                         '</pre>';
+                        }} catch (e) {{
+                            displayValue = String(value);
+                        }}
+                    }} else if (typeof value === 'string') {{
+                        // Escape HTML for strings
+                        displayValue = value.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                        // If it's too long, truncate it
+                        if (displayValue.length > 100) {{
+                            displayValue = displayValue.substring(0, 100) + '...';
+                        }}
+                    }}
+                    content += `<div class="tooltip-item" style="margin-left: 10px;">${{key}}: ${{displayValue}}</div>`;
                 }}
             }}
             
