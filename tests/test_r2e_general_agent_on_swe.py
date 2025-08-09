@@ -47,8 +47,8 @@ API_KEY = os.getenv("LLM_API_KEY", "your-api-key-here")
 BASE_URL = os.getenv("LLM_BASE_URL", "your-base-url-here")
 MODEL_NAME = os.getenv("LLM_MODEL_NAME", "claude-3-sonnet")
 
-# Import R2E configurations from test_r2e_general_agent.py
-from test_r2e_general_agent import (
+# Import R2E configurations
+from workers.tools.r2e_configs import (
     CUSTOM_TOOL_DESCRIPTIONS,
     parse_xml_action_custom,
     CustomDescriptionWrapper,

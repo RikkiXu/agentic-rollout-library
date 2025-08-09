@@ -71,7 +71,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
         sys.exit(1)
     
     # Import R2E configurations
-    from test_r2e_general_agent import (
+    from workers.tools.r2e_configs import (
         CUSTOM_TOOL_DESCRIPTIONS,
         parse_xml_action_custom,
         CustomDescriptionWrapper,

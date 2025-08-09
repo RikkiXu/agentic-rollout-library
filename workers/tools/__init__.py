@@ -39,12 +39,24 @@ except ImportError:
     R2ESubmitTool = None
     R2E_TOOLS_AVAILABLE = False
 
+# Import R2E configurations
+from .r2e_configs import (
+    CUSTOM_TOOL_DESCRIPTIONS,
+    parse_xml_action_custom,
+    CustomDescriptionWrapper,
+    generate_custom_system_prompt
+)
+
 __all__ = [
     'CalculatorTool',
     'BashExecutorTool', 
     'FileEditorTool',
     'SearchTool',
-    'FinishTool'
+    'FinishTool',
+    'CUSTOM_TOOL_DESCRIPTIONS',
+    'parse_xml_action_custom',
+    'CustomDescriptionWrapper',
+    'generate_custom_system_prompt'
 ]
 
 # Add K8s tools to __all__ if available
