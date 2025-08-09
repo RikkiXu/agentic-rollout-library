@@ -43,7 +43,7 @@ class LLMAPIClient:
             logger.error("需要安装openai库: pip install openai")
             raise
     
-    async def generate(self, messages: List[Dict[str, str]], max_tokens: int = 1000, temperature: float = 0.7) -> str:
+    async def generate(self, messages: List[Dict[str, str]], max_tokens: int = 16000, temperature: float = 0.7) -> str:
         """
         Call LLM API to generate response with retry mechanism.
         

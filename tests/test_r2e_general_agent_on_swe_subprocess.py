@@ -94,6 +94,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
     instance_id = instance.get("instance_id", "unknown")
     issue = instance.get("problem_statement", "")
     image = instance.get("image", "")
+    base_commit = instance.get("base_commit", None)  # Get base_commit from instance data
     
     # Use provided model name or default
     actual_model_name = model_name or MODEL_NAME
@@ -295,7 +296,17 @@ Follow these steps to resolve the issue:
             # Get patch
             logger.info("Generating patch...")
             kodo_runner.execute_command(pod, "cd /testbed && git add -A")
-            output, exit_code = kodo_runner.execute_command(pod, "cd /testbed && git diff --cached")
+            
+            # Generate patch based on base_commit if provided, otherwise use --cached
+            if base_commit:
+                logger.info(f"Generating patch against base_commit: {base_commit}")
+                output, exit_code = kodo_runner.execute_command(
+                    pod, 
+                    f"cd /testbed && git diff {base_commit}"
+                )
+            else:
+                logger.info("Generating patch against staged changes")
+                output, exit_code = kodo_runner.execute_command(pod, "cd /testbed && git diff --cached")
             
             if int(exit_code) == 0:
                 patch = output.strip()

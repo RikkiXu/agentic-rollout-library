@@ -31,7 +31,7 @@ class AgenticRolloutConfig:
     # Agent configuration
     agent_type: str = "react"
     max_steps: int = 10
-    max_tokens_per_step: int = 512
+    max_tokens_per_step: int = 16000
     temperature: float = 0.7
     
     # Tool and interaction configuration

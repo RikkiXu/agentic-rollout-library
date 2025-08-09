@@ -26,7 +26,7 @@ class BaseAgent(ABC):
     def __init__(
         self,
         max_steps: int = 10,
-        max_tokens_per_step: int = 512,
+        max_tokens_per_step: int = 16000,
         temperature: float = 0.7,
         tools_config: Optional[Dict[str, Any]] = None,
         **kwargs
