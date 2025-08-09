@@ -251,8 +251,11 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
             
             # Override the generate method to use custom max_tokens
             original_generate = llm_client.generate
-            async def generate_with_custom_tokens(messages, max_tokens_param=None, **kwargs):
-                return await original_generate(messages, max_tokens=max_tokens, **kwargs)
+            async def generate_with_custom_tokens(messages, **kwargs):
+                # Use our custom max_tokens if not already specified
+                if 'max_tokens' not in kwargs:
+                    kwargs['max_tokens'] = max_tokens
+                return await original_generate(messages, **kwargs)
             llm_client.generate = generate_with_custom_tokens
             
             prompt = f"""
