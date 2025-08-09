@@ -251,6 +251,9 @@ Follow these steps to resolve the issue:
 8. Use pip source http://pip.baidu.com/pypi/simple if you need to install new package with python
 """
             
+            # Track timing for statistics
+            import time as timing
+            
             result = await agent.run_trajectory(
                 prompt=prompt,
                 llm_generate_func=llm_client.generate,
@@ -258,6 +261,46 @@ Follow these steps to resolve the issue:
             )
             
             logger.info(f"Agent completed: {result.is_completed}")
+            
+            # Collect statistics from the trajectory
+            stats = {
+                'rounds': 0,
+                'trajectory_length': len(result.steps),
+                'tool_calls': [],
+                'llm_calls': [],
+                'is_completed': result.is_completed
+            }
+            
+            # Count rounds (each action is a round)
+            for step in result.steps:
+                if step.step_type.value == 'action':
+                    stats['rounds'] += 1
+            
+            # Extract tool call statistics with timing
+            tool_start_times = {}
+            for i, step in enumerate(result.steps):
+                # Track tool execution times
+                if step.step_type.value == 'action' and hasattr(step, 'tool_name') and step.tool_name:
+                    tool_start_times[i] = timing.time()
+                elif step.step_type.value == 'action_result' and hasattr(step, 'tool_name') and step.tool_name:
+                    # Find corresponding action step
+                    for j in range(i-1, -1, -1):
+                        if j in tool_start_times:
+                            execution_time = timing.time() - tool_start_times[j]
+                            stats['tool_calls'].append({
+                                'tool': step.tool_name,
+                                'time': execution_time
+                            })
+                            del tool_start_times[j]
+                            break
+            
+            # Count LLM calls (each thought/action generation is an LLM call)
+            llm_steps = [s for s in result.steps if s.step_type.value in ['thought', 'action']]
+            for step in llm_steps:
+                # Estimate generation time based on content length (rough approximation)
+                # In real scenario, this would be tracked in the agent
+                estimated_time = len(step.content) / 1000.0  # Rough estimate: 1 second per 1000 chars
+                stats['llm_calls'].append({'time': estimated_time})
             
             # Save trajectory
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -327,7 +370,8 @@ Follow these steps to resolve the issue:
                     'instance_id': instance_id,
                     'patch': patch,
                     'patch_file': patch_filepath,
-                    'trajectory_file': trajectory_file
+                    'trajectory_file': trajectory_file,
+                    'stats': stats if 'stats' in locals() else {}
                 }
                 
                 # Add profiler files if they exist
@@ -346,7 +390,8 @@ Follow these steps to resolve the issue:
                     'success': False,
                     'instance_id': instance_id,
                     'error': 'No patch generated',
-                    'trajectory_file': trajectory_file
+                    'trajectory_file': trajectory_file,
+                    'stats': stats if 'stats' in locals() else {}
                 }
                 
                 # Add profiler files even for failed runs
@@ -367,7 +412,8 @@ Follow these steps to resolve the issue:
             result_data = {
                 'success': False,
                 'instance_id': instance_id,
-                'error': str(e)
+                'error': str(e),
+                'stats': stats if 'stats' in locals() else {}
             }
             
             # Try to include any files that were created before the error
@@ -475,21 +521,87 @@ class SubprocessSWEBenchRunner:
         results = await asyncio.gather(*[run_with_semaphore(task) for task in tasks], return_exceptions=True)
         elapsed_time = time.time() - start_time
         
-        # Process results
+        # Process results and collect statistics
         successful = 0
         failed = 0
         timeout_count = 0
+        failed_instances = []  # Track failed instance IDs
+        timeout_instances = []  # Track timeout instance IDs
+        successful_instances = []  # Track successful instance IDs
         profiler_files = []
         timeline_files = []
         
+        # Global statistics
+        global_stats = {
+            'total_tool_calls': 0,
+            'total_tool_time': 0.0,
+            'tool_calls_by_type': {},
+            'total_llm_calls': 0,
+            'total_llm_time': 0.0,
+            'rounds': {'min': float('inf'), 'max': 0, 'total': 0, 'count': 0},
+            'trajectory_lengths': {'min': float('inf'), 'max': 0, 'total': 0, 'count': 0},
+            'throughput': {'start_time': start_time, 'completed': 0}
+        }
+        
+        # Process each result and update statistics
         for i, result in enumerate(results):
+            instance_id = instances[i].get('instance_id', f'instance_{i}')
+            
+            # Update progress
+            completed = successful + failed
+            progress = (completed / len(instances)) * 100 if len(instances) > 0 else 0
+            throughput = completed / elapsed_time if elapsed_time > 0 else 0
+            
+            if completed % 5 == 0 or completed == len(instances):  # Log every 5 completions
+                logger.info(f"Progress: {completed}/{len(instances)} ({progress:.1f}%) | "
+                          f"Throughput: {throughput:.2f} rollouts/sec")
+            
             if isinstance(result, Exception):
-                logger.error(f"Task {i} failed with exception: {result}")
+                logger.error(f"Task {i} ({instance_id}) failed with exception: {result}")
                 failed += 1
+                failed_instances.append(instance_id)
             elif result:
+                # Extract statistics if available
+                if 'stats' in result and result['stats']:
+                    stats = result['stats']
+                    
+                    # Update tool statistics
+                    if 'tool_calls' in stats:
+                        for tool_call in stats['tool_calls']:
+                            global_stats['total_tool_calls'] += 1
+                            global_stats['total_tool_time'] += tool_call.get('time', 0)
+                            tool_name = tool_call.get('tool', 'unknown')
+                            if tool_name not in global_stats['tool_calls_by_type']:
+                                global_stats['tool_calls_by_type'][tool_name] = {'count': 0, 'time': 0}
+                            global_stats['tool_calls_by_type'][tool_name]['count'] += 1
+                            global_stats['tool_calls_by_type'][tool_name]['time'] += tool_call.get('time', 0)
+                    
+                    # Update LLM statistics
+                    if 'llm_calls' in stats:
+                        global_stats['total_llm_calls'] += len(stats['llm_calls'])
+                        global_stats['total_llm_time'] += sum(call.get('time', 0) for call in stats['llm_calls'])
+                    
+                    # Update rounds statistics
+                    if 'rounds' in stats:
+                        rounds = stats['rounds']
+                        global_stats['rounds']['min'] = min(global_stats['rounds']['min'], rounds)
+                        global_stats['rounds']['max'] = max(global_stats['rounds']['max'], rounds)
+                        global_stats['rounds']['total'] += rounds
+                        global_stats['rounds']['count'] += 1
+                    
+                    # Update trajectory length statistics
+                    if 'trajectory_length' in stats:
+                        length = stats['trajectory_length']
+                        global_stats['trajectory_lengths']['min'] = min(global_stats['trajectory_lengths']['min'], length)
+                        global_stats['trajectory_lengths']['max'] = max(global_stats['trajectory_lengths']['max'], length)
+                        global_stats['trajectory_lengths']['total'] += length
+                        global_stats['trajectory_lengths']['count'] += 1
+                
                 if result.get('success'):
                     self.patches[result['instance_id']] = result.get('patch', '')
                     successful += 1
+                    successful_instances.append(result['instance_id'])
+                    global_stats['throughput']['completed'] += 1
                     
                     # Collect profiler files
                     if result.get('profiler_file'):
@@ -500,23 +612,70 @@ class SubprocessSWEBenchRunner:
                     failed += 1
                     if result.get('timeout'):
                         timeout_count += 1
+                        timeout_instances.append(result.get('instance_id', instance_id))
+                    else:
+                        failed_instances.append(result.get('instance_id', instance_id))
             else:
                 failed += 1
+                failed_instances.append(instance_id)
         
-        # Print summary
+        # Calculate final statistics
+        avg_tool_time = global_stats['total_tool_time'] / global_stats['total_tool_calls'] if global_stats['total_tool_calls'] > 0 else 0
+        avg_llm_time = global_stats['total_llm_time'] / global_stats['total_llm_calls'] if global_stats['total_llm_calls'] > 0 else 0
+        avg_rounds = global_stats['rounds']['total'] / global_stats['rounds']['count'] if global_stats['rounds']['count'] > 0 else 0
+        avg_trajectory_length = global_stats['trajectory_lengths']['total'] / global_stats['trajectory_lengths']['count'] if global_stats['trajectory_lengths']['count'] > 0 else 0
+        overall_throughput = len(instances) / elapsed_time if elapsed_time > 0 else 0
+        
+        # Print comprehensive summary
         logger.info(f"\n{'='*80}")
-        logger.info(f"Processing complete in {elapsed_time:.2f} seconds")
-        logger.info(f"Total instances: {len(instances)}")
-        logger.info(f"Successful patches: {successful}")
-        logger.info(f"Failed instances: {failed}")
-        if timeout_count > 0:
-            logger.info(f"Timeout instances: {timeout_count} (timeout: {self.timeout_seconds}s)")
-        logger.info(f"Average time per instance: {elapsed_time/len(instances):.2f} seconds")
-        if self.max_concurrent > 1:
-            logger.info(f"Concurrency speedup: ~{self.max_concurrent}x")
+        logger.info(f"PROCESSING SUMMARY")
         logger.info(f"{'='*80}")
         
-        # Save summary
+        # Basic metrics
+        logger.info(f"\n📊 Basic Metrics:")
+        logger.info(f"  Total instances: {len(instances)}")
+        logger.info(f"  Successful: {successful} ({successful/len(instances)*100:.1f}%)")
+        logger.info(f"  Failed: {failed} ({failed/len(instances)*100:.1f}%)")
+        logger.info(f"  Timeout: {timeout_count} ({timeout_count/len(instances)*100:.1f}%)")
+        logger.info(f"  Total time: {elapsed_time:.2f} seconds")
+        logger.info(f"  Average time per instance: {elapsed_time/len(instances):.2f} seconds")
+        
+        # Throughput metrics
+        logger.info(f"\n⚡ Throughput:")
+        logger.info(f"  Overall: {overall_throughput:.3f} rollouts/sec")
+        logger.info(f"  Completed rollouts: {global_stats['throughput']['completed']}")
+        if self.max_concurrent > 1:
+            logger.info(f"  Concurrency: {self.max_concurrent}x parallel")
+        
+        # Tool usage statistics
+        logger.info(f"\n🔧 Tool Usage:")
+        logger.info(f"  Total tool calls: {global_stats['total_tool_calls']}")
+        if global_stats['total_tool_calls'] > 0:
+            logger.info(f"  Average tool execution time: {avg_tool_time:.3f} seconds")
+            logger.info(f"  Tool calls by type:")
+            for tool_name, tool_stats in global_stats['tool_calls_by_type'].items():
+                avg_time = tool_stats['time'] / tool_stats['count'] if tool_stats['count'] > 0 else 0
+                logger.info(f"    - {tool_name}: {tool_stats['count']} calls, avg {avg_time:.3f}s")
+        
+        # LLM usage statistics
+        logger.info(f"\n🤖 LLM Usage:")
+        logger.info(f"  Total LLM calls: {global_stats['total_llm_calls']}")
+        if global_stats['total_llm_calls'] > 0:
+            logger.info(f"  Average LLM call time: {avg_llm_time:.3f} seconds")
+            logger.info(f"  Average LLM calls per instance: {global_stats['total_llm_calls']/len(instances):.1f}")
+        
+        # Trajectory statistics
+        logger.info(f"\n📈 Trajectory Statistics:")
+        if global_stats['rounds']['count'] > 0:
+            logger.info(f"  Rounds: min={global_stats['rounds']['min']}, "
+                      f"max={global_stats['rounds']['max']}, avg={avg_rounds:.1f}")
+        if global_stats['trajectory_lengths']['count'] > 0:
+            logger.info(f"  Trajectory length: min={global_stats['trajectory_lengths']['min']}, "
+                      f"max={global_stats['trajectory_lengths']['max']}, avg={avg_trajectory_length:.1f}")
+        
+        logger.info(f"{'='*80}")
+        
+        # Save comprehensive summary
         summary_file = os.path.join(self.output_dir, "summary.json")
         summary = {
             "total_instances": len(instances),
@@ -524,13 +683,47 @@ class SubprocessSWEBenchRunner:
             "failed_instances": failed,
             "timeout_instances": timeout_count,
             "timeout_seconds": self.timeout_seconds,
-            "instance_ids": list(self.patches.keys()),
+            "max_tokens": self.max_tokens,
+            "local_mode": self.local_mode,
+            "successful_instance_ids": successful_instances,
+            "failed_instance_ids": failed_instances,
+            "timeout_instance_ids": timeout_instances,
             "timestamp": datetime.now().isoformat(),
             "elapsed_time": elapsed_time,
             "max_concurrent": self.max_concurrent,
             "model_name": self.model_name,
             "model_index_range": self.model_index_range,
-            "profiling_enabled": self.enable_profiling
+            "profiling_enabled": self.enable_profiling,
+            "statistics": {
+                "throughput": {
+                    "overall_rollouts_per_sec": overall_throughput,
+                    "avg_time_per_instance": elapsed_time/len(instances) if len(instances) > 0 else 0
+                },
+                "tool_usage": {
+                    "total_calls": global_stats['total_tool_calls'],
+                    "total_time": global_stats['total_tool_time'],
+                    "avg_time": avg_tool_time,
+                    "by_type": global_stats['tool_calls_by_type']
+                },
+                "llm_usage": {
+                    "total_calls": global_stats['total_llm_calls'],
+                    "total_time": global_stats['total_llm_time'],
+                    "avg_time": avg_llm_time,
+                    "avg_calls_per_instance": global_stats['total_llm_calls']/len(instances) if len(instances) > 0 else 0
+                },
+                "trajectory": {
+                    "rounds": {
+                        "min": global_stats['rounds']['min'] if global_stats['rounds']['count'] > 0 else None,
+                        "max": global_stats['rounds']['max'] if global_stats['rounds']['count'] > 0 else None,
+                        "avg": avg_rounds
+                    },
+                    "length": {
+                        "min": global_stats['trajectory_lengths']['min'] if global_stats['trajectory_lengths']['count'] > 0 else None,
+                        "max": global_stats['trajectory_lengths']['max'] if global_stats['trajectory_lengths']['count'] > 0 else None,
+                        "avg": avg_trajectory_length
+                    }
+                }
+            }
         }
         
         # Add profiling info if enabled
