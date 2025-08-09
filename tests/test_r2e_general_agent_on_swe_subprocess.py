@@ -449,11 +449,15 @@ class SubprocessSWEBenchRunner:
                  output_dir: str = "./swe_patches", max_concurrent: int = 1, 
                  enable_profiling: bool = False, model_name: str = None,
                  model_index_range: Optional[Tuple[int, int]] = None,
-                 timeout_seconds: int = 600):  # Default 30 minutes timeout
+                 timeout_seconds: int = 600,  # Default 10 minutes timeout
+                 max_tokens: int = 16000,  # Maximum tokens for model output
+                 local_mode: bool = False):  # Local mode for debugging
         """Initialize the runner.
         
         Args:
-            timeout_seconds: Maximum time in seconds for each instance (default: 1800 = 30 minutes)
+            timeout_seconds: Maximum time in seconds for each instance (default: 600 = 10 minutes)
+            max_tokens: Maximum tokens for model output (default: 16000)
+            local_mode: If True, run instances locally instead of in subprocess
         """
         self.namespace = namespace
         self.kubeconfig_path = kubeconfig_path
@@ -463,11 +467,20 @@ class SubprocessSWEBenchRunner:
         self.model_name = model_name or MODEL_NAME
         self.model_index_range = model_index_range
         self.timeout_seconds = timeout_seconds
+        self.max_tokens = max_tokens
+        self.local_mode = local_mode
         self.patches = {}
         
     async def process_instances(self, instances: List[Dict[str, Any]]):
-        """Process multiple instances concurrently using subprocess."""
+        """Process multiple instances concurrently using subprocess or locally."""
         os.makedirs(self.output_dir, exist_ok=True)
+        
+        # Create logs directory for subprocess logs
+        if not self.local_mode:
+            logs_dir = os.path.join(self.output_dir, "logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            logger.info(f"Subprocess logs will be saved to: {logs_dir}")
+        
         temp_dir = tempfile.mkdtemp(prefix="swe_bench_")
         
         logger.info(f"Processing {len(instances)} instances with max concurrency: {self.max_concurrent}")
@@ -494,7 +507,8 @@ class SubprocessSWEBenchRunner:
                 'namespace': self.namespace,
                 'kubeconfig_path': self.kubeconfig_path,
                 'output_dir': self.output_dir,
-                'enable_profiling': self.enable_profiling
+                'enable_profiling': self.enable_profiling,
+                'max_tokens': self.max_tokens  # Add max_tokens to instance data
             }
             
             # Save instance data to temp file
@@ -505,8 +519,16 @@ class SubprocessSWEBenchRunner:
             # Output file for results
             output_file = os.path.join(temp_dir, f"result_{i}.json")
             
-            # Create async task for subprocess
-            task = self._run_subprocess(i, len(instances), instance_data_file, output_file, actual_model_name)
+            # Create async task for subprocess or local execution
+            if self.local_mode:
+                # Local mode: run directly without subprocess
+                task = self._run_local_instance(i, len(instances), instance_data_file, output_file, actual_model_name)
+            else:
+                # Subprocess mode: run in separate process with logging
+                instance_id = instance.get('instance_id', f'instance_{i}')
+                safe_instance_id = instance_id.replace('/', '_').replace('__', '-')
+                log_file = os.path.join(self.output_dir, "logs", f"{safe_instance_id}.log")
+                task = self._run_subprocess(i, len(instances), instance_data_file, output_file, actual_model_name, log_file)
             tasks.append(task)
         
         # Run tasks with concurrency limit
@@ -741,7 +763,7 @@ class SubprocessSWEBenchRunner:
         shutil.rmtree(temp_dir)
         
     async def _run_subprocess(self, index: int, total: int, instance_data_file: str, 
-                             output_file: str, model_name: str) -> Optional[Dict]:
+                             output_file: str, model_name: str, log_file: str = None) -> Optional[Dict]:
         """Run a single instance in a subprocess with timeout."""
         # Load instance data to get instance_id
         with open(instance_data_file, 'rb') as f:
@@ -749,6 +771,8 @@ class SubprocessSWEBenchRunner:
         instance_id = data['instance'].get('instance_id', f'instance_{index}')
         
         logger.info(f"[{index+1}/{total}] Starting subprocess for {instance_id} with model {model_name} (timeout: {self.timeout_seconds}s)")
+        if log_file:
+            logger.info(f"  Log file: {log_file}")
         
         # Prepare subprocess command
         cmd = [
@@ -758,7 +782,7 @@ class SubprocessSWEBenchRunner:
 import sys
 sys.path.insert(0, '{os.path.dirname(os.path.dirname(__file__))}')
 from tests.test_r2e_general_agent_on_swe_subprocess import process_single_instance
-process_single_instance('{instance_data_file}', '{output_file}', '{model_name}')
+process_single_instance('{instance_data_file}', '{output_file}', '{model_name}', '{log_file if log_file else ""}')
 """
         ]
         
@@ -876,7 +900,11 @@ async def main():
     parser.add_argument("--model-index-range", type=str, default=None,
                        help="Model index range for load balancing, format: 'start,end'")
     parser.add_argument("--timeout", type=int, default=600,
-                       help="Timeout in seconds for each instance (default: 1800 = 30 minutes)")
+                       help="Timeout in seconds for each instance (default: 600 = 10 minutes)")
+    parser.add_argument("--max-tokens", type=int, default=16000,
+                       help="Maximum tokens for model output (default: 16000)")
+    parser.add_argument("--local-mode", action="store_true",
+                       help="Run in local mode without subprocess for debugging")
     
     args = parser.parse_args()
     
@@ -911,7 +939,9 @@ async def main():
         enable_profiling=args.enable_profiling,
         model_name=args.model_name,
         model_index_range=model_index_range,
-        timeout_seconds=args.timeout
+        timeout_seconds=args.timeout,
+        max_tokens=args.max_tokens,
+        local_mode=args.local_mode
     )
     
     # Process instances
