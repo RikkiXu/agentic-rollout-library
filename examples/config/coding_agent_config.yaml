@@ -1,0 +1,234 @@
+defaults:
+  - agentic_rollout_config
+  - _self_
+
+# Coding agent specific configuration for SWE tasks
+actor_rollout_ref:
+  rollout:
+    agent_type: coding
+    max_steps: 25
+    max_tokens_per_step: 512
+    temperature: 0.1  # Lower temperature for more focused code generation
+    
+    # Coding agent specific settings
+    max_files_to_explore: 20
+    max_search_results: 10
+    enable_bash_execution: true
+    test_after_changes: true
+    max_implementation_attempts: 3
+    
+    tools_config:
+      tools:
+        # File operations
+        - class_name: "verl.tools.swe_tools.ViewFileTool"
+          config:
+            type: sandbox
+          tool_schema:
+            type: "function"
+            function:
+              name: "view_file"
+              description: "View the contents of a file"
+              parameters:
+                type: "object"
+                properties:
+                  file_path:
+                    type: "string"
+                    description: "Path to the file to view"
+                  start_line:
+                    type: "integer"
+                    description: "Start line number (optional)"
+                  end_line:
+                    type: "integer"
+                    description: "End line number (optional)"
+                required: ["file_path"]
+        
+        - class_name: "verl.tools.swe_tools.EditFileTool"
+          config:
+            type: sandbox
+            backup_files: true
+          tool_schema:
+            type: "function"
+            function:
+              name: "edit_file"
+              description: "Edit a file by replacing specific content"
+              parameters:
+                type: "object"
+                properties:
+                  file_path:
+                    type: "string"
+                    description: "Path to the file to edit"
+                  old_content:
+                    type: "string"
+                    description: "Content to replace"
+                  new_content:
+                    type: "string"
+                    description: "New content to insert"
+                  line_number:
+                    type: "integer"
+                    description: "Line number for insertion (optional)"
+                required: ["file_path"]
+        
+        - class_name: "verl.tools.swe_tools.CreateFileTool"
+          config:
+            type: sandbox
+          tool_schema:
+            type: "function"
+            function:
+              name: "create_file"
+              description: "Create a new file with specified content"
+              parameters:
+                type: "object"
+                properties:
+                  file_path:
+                    type: "string"
+                    description: "Path for the new file"
+                  content:
+                    type: "string"
+                    description: "Content for the new file"
+                required: ["file_path", "content"]
+        
+        # Search operations
+        - class_name: "verl.tools.swe_tools.SearchCodeTool"
+          config:
+            type: sandbox
+            max_results: 20
+          tool_schema:
+            type: "function"
+            function:
+              name: "search_code"
+              description: "Search for code patterns in the codebase"
+              parameters:
+                type: "object"
+                properties:
+                  query:
+                    type: "string"
+                    description: "Search query or pattern"
+                  file_pattern:
+                    type: "string"
+                    description: "File pattern to search in (e.g., '*.py')"
+                  case_sensitive:
+                    type: "boolean"
+                    description: "Whether search is case sensitive"
+                    default: false
+                required: ["query"]
+        
+        - class_name: "verl.tools.swe_tools.SearchFilesTool"
+          config:
+            type: sandbox
+          tool_schema:
+            type: "function"
+            function:
+              name: "search_files"
+              description: "Search for files by name pattern"
+              parameters:
+                type: "object"
+                properties:
+                  pattern:
+                    type: "string"
+                    description: "File name pattern (supports wildcards)"
+                  directory:
+                    type: "string"
+                    description: "Directory to search in"
+                    default: "."
+                required: ["pattern"]
+        
+        # Execution operations
+        - class_name: "verl.tools.swe_tools.ExecuteBashTool"
+          config:
+            type: sandbox
+            timeout: 60
+            allowed_commands:
+              - "ls"
+              - "cat"
+              - "grep"
+              - "find"
+              - "python"
+              - "pip"
+              - "git"
+              - "pytest"
+              - "npm"
+              - "node"
+              - "make"
+              - "cd"
+              - "pwd"
+              - "which"
+              - "echo"
+              - "mkdir"
+              - "rm"
+              - "cp"
+              - "mv"
+          tool_schema:
+            type: "function"
+            function:
+              name: "execute_bash"
+              description: "Execute bash commands in the sandbox"
+              parameters:
+                type: "object"
+                properties:
+                  command:
+                    type: "string"
+                    description: "Bash command to execute"
+                  working_dir:
+                    type: "string"
+                    description: "Working directory for command execution"
+                required: ["command"]
+        
+        - class_name: "verl.tools.swe_tools.RunTestsTool"
+          config:
+            type: sandbox
+            timeout: 120
+          tool_schema:
+            type: "function"
+            function:
+              name: "run_tests"
+              description: "Run tests to validate code changes"
+              parameters:
+                type: "object"
+                properties:
+                  test_command:
+                    type: "string"
+                    description: "Test command to run (e.g., 'pytest', 'npm test')"
+                  test_file:
+                    type: "string"
+                    description: "Specific test file to run"
+                  working_dir:
+                    type: "string"
+                    description: "Working directory for test execution"
+                required: ["test_command"]
+
+# Data configuration for SWE tasks
+data:
+  train_files: examples/data/swe_problems_train.parquet
+  val_files: examples/data/swe_problems_val.parquet
+  prompt_key: problem_description
+  chosen_key: solution
+  max_prompt_length: 1024
+  max_response_length: 2048
+
+# Training configuration optimized for SWE tasks
+trainer:
+  total_epochs: 3
+  rollout_batch_size: 2  # Smaller batch size due to complexity
+  train_batch_size: 2
+  save_freq: 100
+
+# Algorithm configuration for coding tasks
+algorithm:
+  kl_ctrl:
+    kl_coef: 0.1  # Higher KL penalty to prevent drift
+  adv_estimator: gae
+  gamma: 1.0
+  lam: 0.95
+
+# Reward model configuration
+reward_model:
+  reward_manager: batch
+  # Custom reward function for SWE tasks
+  custom_reward_function:
+    path: "examples/swe_reward_function.py"
+    name: "compute_swe_reward"
+    reward_kwargs:
+      test_weight: 0.6      # Weight for test pass rate
+      compile_weight: 0.2   # Weight for code compilation
+      style_weight: 0.1     # Weight for code style
+      coverage_weight: 0.1  # Weight for test coverage

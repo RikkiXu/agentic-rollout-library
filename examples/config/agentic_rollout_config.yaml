@@ -1,0 +1,64 @@
+defaults:
+  - base_trainer_config
+  - _self_
+
+# Override rollout configuration to use agentic rollout
+actor_rollout_ref:
+  rollout:
+    name: agentic
+    agent_type: react  # Options: react, tool, reasoning
+    max_steps: 10
+    max_tokens_per_step: 512
+    temperature: 0.7
+    
+    # Tool configuration
+    tools_config:
+      tools:
+        - class_name: "verl.tools.gsm8k_tool.Gsm8kTool"
+          config:
+            type: native
+          tool_schema:
+            type: "function"
+            function:
+              name: "calculate_answer"
+              description: "Calculate the answer to a GSM8K math problem"
+              parameters:
+                type: "object"
+                properties:
+                  answer:
+                    type: "string"
+                    description: "The final numerical answer"
+                required: ["answer"]
+    
+    # Performance settings
+    batch_size: 1
+    concurrent_requests: 4
+    
+    # Output settings
+    include_trajectory_in_output: true
+    save_trajectories: false
+    trajectory_save_path: "./trajectories"
+
+# Data configuration for agentic rollouts
+data:
+  train_files: examples/data/gsm8k_train_sample.parquet
+  val_files: examples/data/gsm8k_val_sample.parquet
+  prompt_key: prompt
+  chosen_key: response
+  max_prompt_length: 512
+  max_response_length: 1024
+
+# Training configuration
+trainer:
+  total_epochs: 1
+  rollout_batch_size: 4
+  train_batch_size: 4
+  save_freq: 500
+
+# Algorithm configuration  
+algorithm:
+  kl_ctrl:
+    kl_coef: 0.05
+  adv_estimator: gae
+  gamma: 1.0
+  lam: 0.95

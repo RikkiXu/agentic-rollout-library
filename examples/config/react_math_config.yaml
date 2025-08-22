@@ -1,0 +1,59 @@
+defaults:
+  - agentic_rollout_config
+  - _self_
+
+# ReAct agent specific configuration for math problems
+actor_rollout_ref:
+  rollout:
+    agent_type: react
+    max_steps: 15
+    max_tokens_per_step: 256
+    temperature: 0.3
+    
+    # ReAct specific settings
+    require_thought_before_action: true
+    max_consecutive_thoughts: 2
+    enable_self_reflection: true
+    
+    tools_config:
+      tools:
+        - class_name: "verl.tools.gsm8k_tool.Gsm8kTool"
+          config:
+            type: native
+          tool_schema:
+            type: "function"
+            function:
+              name: "verify_answer"
+              description: "Verify if the mathematical answer is correct"
+              parameters:
+                type: "object"
+                properties:
+                  answer:
+                    type: "string"
+                    description: "The numerical answer to verify"
+                  reasoning:
+                    type: "string"
+                    description: "The step-by-step reasoning"
+                required: ["answer"]
+        
+        - class_name: "verl.tools.sandbox_fusion_tools.CodeExecutionTool"
+          config:
+            type: sandbox
+            timeout: 30
+          tool_schema:
+            type: "function"
+            function:
+              name: "execute_calculation"
+              description: "Execute Python code for mathematical calculations"
+              parameters:
+                type: "object"
+                properties:
+                  code:
+                    type: "string"
+                    description: "Python code to execute"
+                required: ["code"]
+
+# Data specific to math problems
+data:
+  train_files: examples/data/math_problems_train.parquet
+  val_files: examples/data/math_problems_val.parquet
